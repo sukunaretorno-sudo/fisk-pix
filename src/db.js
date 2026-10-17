@@ -1,15 +1,14 @@
-const { DatabaseSync } = require('node:sqlite');
-const path = require('path');
+const { createDatabase } = require('./db-driver');
 const { hashPassword } = require('./auth');
+const db = createDatabase();
 
-const DB_PATH = path.join(__dirname, '..', 'database.sqlite');
-const db = new DatabaseSync(DB_PATH);
+async function initialize() {
+  await db.exec(SCHEMA);
+  await applyMigrations();
+  await seed();
+}
 
-// Enable WAL mode for high performance and concurrency
-db.exec('PRAGMA journal_mode = WAL;');
-
-// Initialize tables
-db.exec(`
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS classes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
@@ -98,26 +97,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_tx_to_from ON transactions(to_user_id, from_user_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
   CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(created_at DESC);
-`);
+`;
 
 // Handle migrations
-function applyMigrations() {
-  db.exec('PRAGMA foreign_keys = OFF;');
+async function applyMigrations() {
+  // No PRAGMA changes needed for a fresh Turso database.
 
   // Check classes table for teacher_id
-  const classCols = db.prepare(`PRAGMA table_info(classes)`).all().map(c => c.name);
+  const classCols = (await db.prepare(`PRAGMA table_info(classes)`).all()).map(c => c.name);
   if (!classCols.includes('teacher_id')) {
-    db.exec(`ALTER TABLE classes ADD COLUMN teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL;`);
+    await db.exec(`ALTER TABLE classes ADD COLUMN teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL;`);
   }
 
   // Remove perks from store_items as requested (store now only has Profile Frames)
-  db.exec(`DELETE FROM store_items WHERE category != 'frame';`);
+  await db.exec(`DELETE FROM store_items WHERE category != 'frame';`);
 
   // Migrate users table to remove strict CHECK constraint on role if present
   try {
-    const userSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='users'`).get().sql;
+    const userSql = (await db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='users'`).get()).sql;
     if (userSql && userSql.includes(`'admin')`)) {
-      db.exec(`
+      await db.exec(`
         CREATE TABLE IF NOT EXISTS users_temp (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           username TEXT UNIQUE NOT NULL COLLATE NOCASE,
@@ -136,92 +135,91 @@ function applyMigrations() {
     }
   } catch (e) {}
 
-  db.exec('PRAGMA foreign_keys = ON;');
+
 }
 
-applyMigrations();
-
 // Seed initial classes, users, frames, and coordination account
-function seed() {
+async function seed() {
   const now = Date.now();
 
-  // Seed Coordenação user (login: Coordenação or coordenacao, senha: Coordenação26@)
-  const coordExists = db.prepare(`SELECT id FROM users WHERE username = 'coordenacao' OR username = 'coordenação'`).get();
+  // First login: coordenacao; initial password comes from COORDENACAO_PASSWORD env
+  const coordExists = (await db.prepare(`SELECT id FROM users WHERE username = 'coordenacao' OR username = 'coordenação'`).get());
   if (!coordExists) {
+    if (!process.env.COORDENACAO_PASSWORD || process.env.COORDENACAO_PASSWORD.length < 8 || process.env.COORDENACAO_PASSWORD.startsWith('DEFINA_')) {
+      throw new Error('Defina COORDENACAO_PASSWORD (8+ caracteres) no .env ou nas variáveis do Render antes do primeiro deploy.');
+    }
     console.log('[DB] Criando conta da Coordenação Pedagógica...');
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO users (username, name, role, password_hash, class_id, active_frame, created_at)
       VALUES (?, ?, ?, ?, NULL, 'none', ?)
-    `).run('coordenacao', 'Coordenação Pedagógica', 'coordenacao', hashPassword('Coordenação26@'), now);
+    `).run('coordenacao', 'Coordenação Pedagógica', 'coordenacao', hashPassword(process.env.COORDENACAO_PASSWORD), now));
   }
 
   // Seed initial classes
-  const classCount = db.prepare('SELECT COUNT(*) as c FROM classes').get().c;
+  const classCount = (await db.prepare('SELECT COUNT(*) as c FROM classes').get()).c;
   if (classCount === 0) {
     const insertClass = db.prepare('INSERT INTO classes (name, level, teacher_id, created_at) VALUES (?, ?, ?, ?)');
-    insertClass.run('Teens 1', 'Intermediário', 2, now); // teacher_id = 2 (teacher)
-    insertClass.run('Adults 2', 'Avançado', 2, now);
-    insertClass.run('Kids 3', 'Iniciante', 2, now);
+    await insertClass.run('Teens 1', 'Intermediário', null, now); // teacher is assigned when registered
+    await insertClass.run('Adults 2', 'Avançado', null, now);
+    await insertClass.run('Kids 3', 'Iniciante', null, now);
   } else {
     // Ensure classes have teacher_id linked to teacher if null
-    const teacherUser = db.prepare(`SELECT id FROM users WHERE role = 'teacher'`).get();
+    const teacherUser = (await db.prepare(`SELECT id FROM users WHERE role = 'teacher'`).get());
     if (teacherUser) {
-      db.prepare(`UPDATE classes SET teacher_id = ? WHERE teacher_id IS NULL`).run(teacherUser.id);
+      (await db.prepare(`UPDATE classes SET teacher_id = ? WHERE teacher_id IS NULL`).run(teacherUser.id));
     }
   }
 
   // Seed Store Profile Frames (Only Frames!)
-  const storeCount = db.prepare('SELECT COUNT(*) as c FROM store_items').get().c;
+  const storeCount = (await db.prepare('SELECT COUNT(*) as c FROM store_items').get()).c;
   if (storeCount === 0) {
     const insertItem = db.prepare(`
       INSERT INTO store_items (id, name, description, category, price, icon, frame_css, created_at)
       VALUES (?, ?, ?, 'frame', ?, ?, ?, ?)
     `);
 
-    insertItem.run('frame-gold', 'Moldura Dourada VIP', 'Borda dourada reluzente com efeito Shimmer VIP.', 30, '🥇', 'frame-gold', now);
-    insertItem.run('frame-fire', 'Moldura On Fire 🔥', 'Chamas pulsantes para os alunos com maior ofensiva de presenças.', 45, '🔥', 'frame-fire', now);
-    insertItem.run('frame-neon', 'Moldura Cyber Neon ⚡', 'Brilho neon futurista ciano e magenta.', 50, '⚡', 'frame-neon', now);
-    insertItem.run('frame-diamond', 'Moldura Diamante Fisk 💎', 'Prisma de diamante ultra-raro com reflexo cristalino.', 100, '💎', 'frame-diamond', now);
-    insertItem.run('frame-stars', 'Moldura Stars & Stripes ⭐', 'Estrelas comemorativas Fisk & bandeira americana.', 35, '⭐', 'frame-stars', now);
-    insertItem.run('frame-crown', 'Coroa Real English Master 👑', 'Coroa dourada flutuante para os mestres de conversação.', 75, '👑', 'frame-crown', now);
+    await insertItem.run('frame-gold', 'Moldura Dourada VIP', 'Borda dourada reluzente com efeito Shimmer VIP.', 30, '🥇', 'frame-gold', now);
+    await insertItem.run('frame-fire', 'Moldura On Fire 🔥', 'Chamas pulsantes para os alunos com maior ofensiva de presenças.', 45, '🔥', 'frame-fire', now);
+    await insertItem.run('frame-neon', 'Moldura Cyber Neon ⚡', 'Brilho neon futurista ciano e magenta.', 50, '⚡', 'frame-neon', now);
+    await insertItem.run('frame-diamond', 'Moldura Diamante Fisk 💎', 'Prisma de diamante ultra-raro com reflexo cristalino.', 100, '💎', 'frame-diamond', now);
+    await insertItem.run('frame-stars', 'Moldura Stars & Stripes ⭐', 'Estrelas comemorativas Fisk & bandeira americana.', 35, '⭐', 'frame-stars', now);
+    await insertItem.run('frame-crown', 'Coroa Real English Master 👑', 'Coroa dourada flutuante para os mestres de conversação.', 75, '👑', 'frame-crown', now);
   }
 }
-
-seed();
 
 /* ========================================================
    Audit Logging (Coordenação Tracking)
    ======================================================== */
-function logAudit(teacherId, action, targetUserId, details) {
-  const teacher = getUserById(teacherId);
+async function logAudit(teacherId, action, targetUserId, details) {
+  const teacher = await getUserById(teacherId);
   const teacherName = teacher ? teacher.name : `ID #${teacherId}`;
   let targetName = null;
   if (targetUserId) {
-    const target = getUserById(targetUserId);
+    const target = await getUserById(targetUserId);
     targetName = target ? target.name : `ID #${targetUserId}`;
   }
 
-  db.prepare(`
+  (await db.prepare(`
     INSERT INTO audit_logs (teacher_id, teacher_name, action, target_user_id, target_name, details, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(teacherId, teacherName, action, targetUserId || null, targetName || null, details, Date.now());
+  `).run(teacherId, teacherName, action, targetUserId || null, targetName || null, details, Date.now()));
 }
 
-function getAuditLogs(limit = 100) {
-  return db.prepare(`
+async function getAuditLogs(limit = 100) {
+  return (await db.prepare(`
     SELECT a.*, u.username as teacher_username, t.username as target_username
     FROM audit_logs a
     LEFT JOIN users u ON a.teacher_id = u.id
     LEFT JOIN users t ON a.target_user_id = t.id
     ORDER BY a.created_at DESC
     LIMIT ?
-  `).all(limit);
+  `).all(limit));
 }
 
 /* ========================================================
    Classes Operations
    ======================================================== */
-function getAllClasses(teacherId = null) {
+async function getAllClasses(teacherId = null) {
   let query = `
     SELECT c.id, c.name, c.level, c.teacher_id, u_teach.name as teacher_name, u_teach.username as teacher_username,
            COUNT(DISTINCT u_stud.id) as student_count
@@ -235,21 +233,21 @@ function getAllClasses(teacherId = null) {
     params.push(teacherId);
   }
   query += ` GROUP BY c.id ORDER BY c.name ASC`;
-  return db.prepare(query).all(...params);
+  return (await db.prepare(query).all(...params));
 }
 
-function createClass(name, level, teacherId = null) {
+async function createClass(name, level, teacherId = null) {
   const now = Date.now();
-  const res = db.prepare(`INSERT INTO classes (name, level, teacher_id, created_at) VALUES (?, ?, ?, ?)`).run(name.trim(), level ? level.trim() : '', teacherId || null, now);
+  const res = (await db.prepare(`INSERT INTO classes (name, level, teacher_id, created_at) VALUES (?, ?, ?, ?)`).run(name.trim(), level ? level.trim() : '', teacherId || null, now));
   return { id: res.lastInsertRowid, name, level, teacherId };
 }
 
-function updateClassTeacher(classId, teacherId) {
-  return db.prepare(`UPDATE classes SET teacher_id = ? WHERE id = ?`).run(teacherId || null, classId);
+async function updateClassTeacher(classId, teacherId) {
+  return (await db.prepare(`UPDATE classes SET teacher_id = ? WHERE id = ?`).run(teacherId || null, classId));
 }
 
-function assignStudentClass(userId, classId) {
-  return db.prepare(`UPDATE users SET class_id = ? WHERE id = ?`).run(classId || null, userId);
+async function assignStudentClass(userId, classId) {
+  return (await db.prepare(`UPDATE users SET class_id = ? WHERE id = ?`).run(classId || null, userId));
 }
 
 /* ========================================================
@@ -260,30 +258,30 @@ function normalizeUsername(u) {
   return u.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
 }
 
-function getUserByUsername(username) {
+async function getUserByUsername(username) {
   const raw = String(username).trim();
   const clean = normalizeUsername(raw);
 
-  return db.prepare(`
+  return (await db.prepare(`
     SELECT u.id, u.username, u.name, u.role, u.password_hash, u.class_id, u.active_frame, u.created_at, w.balance, c.name as class_name
     FROM users u
     LEFT JOIN wallets w ON u.id = w.user_id
     LEFT JOIN classes c ON u.class_id = c.id
     WHERE u.username = ? OR u.username = ?
-  `).get(raw, clean);
+  `).get(raw, clean));
 }
 
-function getUserById(id) {
-  return db.prepare(`
+async function getUserById(id) {
+  return (await db.prepare(`
     SELECT u.id, u.username, u.name, u.role, u.class_id, u.active_frame, u.created_at, w.balance, c.name as class_name
     FROM users u
     LEFT JOIN wallets w ON u.id = w.user_id
     LEFT JOIN classes c ON u.class_id = c.id
     WHERE u.id = ?
-  `).get(id);
+  `).get(id));
 }
 
-function getAllUsers(classId = null, role = null) {
+async function getAllUsers(classId = null, role = null) {
   let query = `
     SELECT u.id, u.username, u.name, u.role, u.class_id, u.active_frame, u.created_at, 
            COALESCE(w.balance, 0) as balance, c.name as class_name
@@ -302,47 +300,47 @@ function getAllUsers(classId = null, role = null) {
     params.push(role);
   }
   query += ` ORDER BY u.name ASC`;
-  return db.prepare(query).all(...params);
+  return (await db.prepare(query).all(...params));
 }
 
-function createUser(username, name, role, password, classId = null) {
+async function createUser(username, name, role, password, classId = null) {
   const now = Date.now();
-  db.exec('BEGIN TRANSACTION;');
+  const tx = await db.transaction();
   try {
     const cleanUsername = normalizeUsername(username);
-    const res = db.prepare(`
+    const res = (await tx.prepare(`
       INSERT INTO users (username, name, role, password_hash, class_id, active_frame, created_at)
       VALUES (?, ?, ?, ?, ?, 'none', ?)
-    `).run(cleanUsername, name.trim(), role, hashPassword(password), classId || null, now);
+    `).run(cleanUsername, name.trim(), role, hashPassword(password), classId || null, now));
 
     const userId = res.lastInsertRowid;
 
     // Wallets are only for students (aluno) or admin
     if (role === 'aluno' || role === 'admin') {
-      db.prepare(`
+      (await tx.prepare(`
         INSERT INTO wallets (user_id, balance, updated_at)
         VALUES (?, 0, ?)
-      `).run(userId, now);
+      `).run(userId, now));
     }
 
-    db.exec('COMMIT;');
-    return getUserById(userId);
+    await tx.commit();
+    return await getUserById(userId);
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await tx.rollback();
     throw err;
   }
 }
 
-function updatePassword(userId, newPassword) {
-  return db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hashPassword(newPassword), userId);
+async function updatePassword(userId, newPassword) {
+  return (await db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hashPassword(newPassword), userId));
 }
 
 /* ========================================================
    Login Security / Brute Force Protection
    ======================================================== */
-function checkLoginLock(username) {
+async function checkLoginLock(username) {
   const clean = normalizeUsername(username);
-  const row = db.prepare('SELECT attempts, locked_until FROM login_security WHERE username = ?').get(clean);
+  const row = (await db.prepare('SELECT attempts, locked_until FROM login_security WHERE username = ?').get(clean));
   if (!row) return { locked: false };
   const now = Date.now();
   if (row.locked_until > now) {
@@ -352,24 +350,24 @@ function checkLoginLock(username) {
   return { locked: false };
 }
 
-function recordLoginFailure(username) {
+async function recordLoginFailure(username) {
   const clean = normalizeUsername(username);
   const now = Date.now();
-  const row = db.prepare('SELECT attempts FROM login_security WHERE username = ?').get(clean);
+  const row = (await db.prepare('SELECT attempts FROM login_security WHERE username = ?').get(clean));
   const attempts = (row ? row.attempts : 0) + 1;
   let lockedUntil = 0;
   if (attempts >= 5) {
     lockedUntil = now + 5 * 60 * 1000;
   }
-  db.prepare(`
+  (await db.prepare(`
     INSERT INTO login_security (username, attempts, locked_until)
     VALUES (?, ?, ?)
     ON CONFLICT(username) DO UPDATE SET attempts = ?, locked_until = ?
-  `).run(clean, attempts, lockedUntil, attempts, lockedUntil);
+  `).run(clean, attempts, lockedUntil, attempts, lockedUntil));
 }
 
-function clearLoginFailures(username) {
-  db.prepare('DELETE FROM login_security WHERE username = ?').run(normalizeUsername(username));
+async function clearLoginFailures(username) {
+  (await db.prepare('DELETE FROM login_security WHERE username = ?').run(normalizeUsername(username)));
 }
 
 /* ========================================================
@@ -381,7 +379,7 @@ function generatePixCode() {
   return `P${t}${r}`;
 }
 
-function transferPix(fromUserId, toUserId, rawAmount, rawNote) {
+async function transferPix(fromUserId, toUserId, rawAmount, rawNote) {
   const amount = Math.floor(Number(rawAmount));
   if (isNaN(amount) || amount <= 0) {
     throw new Error('O valor do Pix deve ser um número inteiro positivo.');
@@ -391,8 +389,8 @@ function transferPix(fromUserId, toUserId, rawAmount, rawNote) {
     throw new Error('Você não pode enviar um Pix para si mesmo.');
   }
 
-  const sender = getUserById(fromUserId);
-  const recipient = getUserById(toUserId);
+  const sender = await getUserById(fromUserId);
+  const recipient = await getUserById(toUserId);
 
   if (!sender || !recipient) {
     throw new Error('Conta de remetente ou destinatário não encontrada.');
@@ -410,24 +408,24 @@ function transferPix(fromUserId, toUserId, rawAmount, rawNote) {
   const now = Date.now();
   const code = generatePixCode();
 
-  db.exec('BEGIN TRANSACTION;');
+  const tx = await db.transaction();
   try {
-    const senderWallet = db.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(fromUserId);
+    const senderWallet = (await tx.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(fromUserId));
     if (!senderWallet || senderWallet.balance < amount) {
       throw new Error('Saldo insuficiente para realizar esta transferência.');
     }
 
-    db.prepare('UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE user_id = ?').run(amount, now, fromUserId);
-    db.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?').run(amount, now, toUserId);
+    (await tx.prepare('UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE user_id = ?').run(amount, now, fromUserId));
+    (await tx.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?').run(amount, now, toUserId));
 
-    const newSenderWallet = db.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(fromUserId);
+    const newSenderWallet = (await tx.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(fromUserId));
 
-    db.prepare(`
+    (await tx.prepare(`
       INSERT INTO transactions (code, type, from_user_id, to_user_id, amount, balance_after, note, created_at)
       VALUES (?, 'pix', ?, ?, ?, ?, ?, ?)
-    `).run(code, fromUserId, toUserId, amount, newSenderWallet.balance, note, now);
+    `).run(code, fromUserId, toUserId, amount, newSenderWallet.balance, note, now));
 
-    db.exec('COMMIT;');
+    await tx.commit();
 
     return {
       code,
@@ -439,12 +437,12 @@ function transferPix(fromUserId, toUserId, rawAmount, rawNote) {
       new_balance: newSenderWallet.balance
     };
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await tx.rollback();
     throw err;
   }
 }
 
-function getTransactions(userId = null, filter = 'all', limit = 50) {
+async function getTransactions(userId = null, filter = 'all', limit = 50) {
   let query = `
     SELECT 
       t.id, t.code, t.type, t.amount, t.note, t.created_at,
@@ -473,13 +471,13 @@ function getTransactions(userId = null, filter = 'all', limit = 50) {
   query += ` ORDER BY t.created_at DESC LIMIT ?`;
   params.push(limit);
 
-  return db.prepare(query).all(...params);
+  return (await db.prepare(query).all(...params));
 }
 
 /* ========================================================
    Attendance & Streaks
    ======================================================== */
-function getAttendanceForDate(date, classId = null) {
+async function getAttendanceForDate(date, classId = null) {
   let query = `
     SELECT a.date, a.user_id, a.status, u.name, u.username, u.class_id, c.name as class_name
     FROM users u
@@ -493,15 +491,15 @@ function getAttendanceForDate(date, classId = null) {
     params.push(classId);
   }
   query += ` ORDER BY u.name ASC`;
-  return db.prepare(query).all(...params);
+  return (await db.prepare(query).all(...params));
 }
 
-function calculateStreaks(userId) {
-  const records = db.prepare(`
+async function calculateStreaks(userId) {
+  const records = (await db.prepare(`
     SELECT date, status FROM attendance
     WHERE user_id = ?
     ORDER BY date ASC
-  `).all(userId);
+  `).all(userId));
 
   let currentStreak = 0;
   let bestStreak = 0;
@@ -526,26 +524,26 @@ function calculateStreaks(userId) {
   };
 }
 
-function markAttendance(date, userId, newStatus, teacherId) {
+async function markAttendance(date, userId, newStatus, teacherId) {
   const now = Date.now();
-  db.exec('BEGIN TRANSACTION;');
+  const tx = await db.transaction();
   try {
-    const existing = db.prepare('SELECT status FROM attendance WHERE date = ? AND user_id = ?')
-      .get(date, userId);
+    const existing = (await tx.prepare('SELECT status FROM attendance WHERE date = ? AND user_id = ?')
+      .get(date, userId));
 
     const oldStatus = existing ? existing.status : null;
     let balanceDelta = 0;
     let finalStatus = null;
 
     if (oldStatus === newStatus) {
-      db.prepare('DELETE FROM attendance WHERE date = ? AND user_id = ?').run(date, userId);
+      (await tx.prepare('DELETE FROM attendance WHERE date = ? AND user_id = ?').run(date, userId));
       if (oldStatus === 'p') balanceDelta = -3;
     } else {
-      db.prepare(`
+      (await tx.prepare(`
         INSERT INTO attendance (date, user_id, status, created_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(date, user_id) DO UPDATE SET status = ?
-      `).run(date, userId, newStatus, now, newStatus);
+      `).run(date, userId, newStatus, now, newStatus));
 
       finalStatus = newStatus;
       if (newStatus === 'p' && oldStatus !== 'p') balanceDelta = 3;
@@ -553,30 +551,30 @@ function markAttendance(date, userId, newStatus, teacherId) {
     }
 
     if (balanceDelta !== 0) {
-      const wallet = db.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(userId);
+      const wallet = (await tx.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(userId));
       let newBalance = wallet.balance + balanceDelta;
       if (newBalance < 0) newBalance = 0;
 
-      db.prepare('UPDATE wallets SET balance = ?, updated_at = ? WHERE user_id = ?').run(newBalance, now, userId);
+      (await tx.prepare('UPDATE wallets SET balance = ?, updated_at = ? WHERE user_id = ?').run(newBalance, now, userId));
 
       const code = generatePixCode();
       const dateFmt = date.split('-').reverse().slice(0, 2).join('/');
       const note = balanceDelta > 0 ? `Presença em aula (${dateFmt})` : `Estorno de presença (${dateFmt})`;
 
-      db.prepare(`
+      (await tx.prepare(`
         INSERT INTO transactions (code, type, from_user_id, to_user_id, amount, balance_after, note, created_at)
         VALUES (?, 'att', ?, ?, ?, ?, ?, ?)
-      `).run(code, teacherId, userId, balanceDelta, newBalance, note, now);
+      `).run(code, teacherId, userId, balanceDelta, newBalance, note, now));
     }
 
-    db.exec('COMMIT;');
+    await tx.commit();
 
-    const student = getUserById(userId);
-    const streaks = calculateStreaks(userId);
+    const student = await getUserById(userId);
+    const streaks = await calculateStreaks(userId);
 
     // Audit log
     const dateFmt = date.split('-').reverse().join('/');
-    logAudit(teacherId, 'attendance', userId, `Marcação de ${finalStatus === 'p' ? 'Presença (+F$ 3)' : finalStatus === 'f' ? 'Falta' : 'Desmarcado'} em ${dateFmt}`);
+    await logAudit(teacherId, 'attendance', userId, `Marcação de ${finalStatus === 'p' ? 'Presença (+F$ 3)' : finalStatus === 'f' ? 'Falta' : 'Desmarcado'} em ${dateFmt}`);
 
     return {
       date,
@@ -586,7 +584,7 @@ function markAttendance(date, userId, newStatus, teacherId) {
       streaks
     };
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await tx.rollback();
     throw err;
   }
 }
@@ -594,44 +592,43 @@ function markAttendance(date, userId, newStatus, teacherId) {
 /* ========================================================
    Teacher Merit Awards & Admin Balance Adjustments
    ======================================================== */
-function teacherAwardMerit(teacherId, studentId, rawAmount, rawReason) {
+async function teacherAwardMerit(teacherId, studentId, rawAmount, rawReason) {
   const amount = Math.floor(Number(rawAmount));
   if (isNaN(amount) || amount <= 0) throw new Error('Informe um valor válido em Fisk Dollars.');
   const reason = rawReason ? String(rawReason).trim().slice(0, 100) : 'Mérito em aula de inglês';
   const now = Date.now();
 
-  db.exec('BEGIN TRANSACTION;');
+  const student = await getUserById(studentId);
+  if (!student || student.role !== 'aluno') throw new Error('Aluno não encontrado.');
+  const tx = await db.transaction();
   try {
-    const student = getUserById(studentId);
-    if (!student || student.role !== 'aluno') throw new Error('Aluno não encontrado.');
-
-    db.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?').run(amount, now, studentId);
-    const newBal = db.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(studentId).balance;
+    (await tx.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?').run(amount, now, studentId));
+    const newBal = (await tx.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(studentId)).balance;
 
     const code = generatePixCode();
-    db.prepare(`
+    (await tx.prepare(`
       INSERT INTO transactions (code, type, from_user_id, to_user_id, amount, balance_after, note, created_at)
       VALUES (?, 'mint', ?, ?, ?, ?, ?, ?)
-    `).run(code, teacherId, studentId, amount, newBal, `Mérito: ${reason}`, now);
+    `).run(code, teacherId, studentId, amount, newBal, `Mérito: ${reason}`, now));
 
-    db.exec('COMMIT;');
+    await tx.commit();
 
-    logAudit(teacherId, 'merit', studentId, `Premiou F$ ${amount} (${reason})`);
+    await logAudit(teacherId, 'merit', studentId, `Premiou F$ ${amount} (${reason})`);
     return { studentId, studentName: student.name, amount, newBalance: newBal };
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await tx.rollback();
     throw err;
   }
 }
 
-function adminAdjustBalance(kind, adminId, toUserId, rawAmount, rawNote) {
+async function adminAdjustBalance(kind, adminId, toUserId, rawAmount, rawNote) {
   const amount = Math.floor(Number(rawAmount));
   const note = rawNote ? String(rawNote).trim().slice(0, 100) : '';
   const now = Date.now();
 
-  db.exec('BEGIN TRANSACTION;');
+  const tx = await db.transaction();
   try {
-    const targetWallet = db.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(toUserId);
+    const targetWallet = (await tx.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(toUserId));
     if (!targetWallet) throw new Error('Conta de destino não encontrada.');
 
     let newBalance = targetWallet.balance;
@@ -654,25 +651,25 @@ function adminAdjustBalance(kind, adminId, toUserId, rawAmount, rawNote) {
       throw new Error('Operação administrativa inválida.');
     }
 
-    db.prepare('UPDATE wallets SET balance = ?, updated_at = ? WHERE user_id = ?').run(newBalance, now, toUserId);
+    (await tx.prepare('UPDATE wallets SET balance = ?, updated_at = ? WHERE user_id = ?').run(newBalance, now, toUserId));
 
     const code = generatePixCode();
-    db.prepare(`
+    (await tx.prepare(`
       INSERT INTO transactions (code, type, from_user_id, to_user_id, amount, balance_after, note, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(code, kind, adminId, toUserId, delta, newBalance, note, now);
+    `).run(code, kind, adminId, toUserId, delta, newBalance, note, now));
 
-    db.exec('COMMIT;');
+    await tx.commit();
 
-    logAudit(adminId, kind, toUserId, `${kind === 'mint' ? 'Emitiu' : kind === 'set' ? 'Definiu saldo' : 'Retirou'} F$ ${amount}. ${note}`);
+    await logAudit(adminId, kind, toUserId, `${kind === 'mint' ? 'Emitiu' : kind === 'set' ? 'Definiu saldo' : 'Retirou'} F$ ${amount}. ${note}`);
     return { toUserId, newBalance, delta };
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await tx.rollback();
     throw err;
   }
 }
 
-function adminBulkReward(adminId, rawAmount, rawNote, classId = null) {
+async function adminBulkReward(adminId, rawAmount, rawNote, classId = null) {
   const amount = Math.floor(Number(rawAmount));
   if (isNaN(amount) || amount <= 0) throw new Error('Informe um valor válido maior que zero.');
   const note = rawNote ? String(rawNote).trim().slice(0, 100) : 'Bônus coletivo Fisk';
@@ -685,32 +682,32 @@ function adminBulkReward(adminId, rawAmount, rawNote, classId = null) {
     params.push(classId);
   }
 
-  const students = db.prepare(query).all(...params);
+  const students = (await db.prepare(query).all(...params));
   if (students.length === 0) return { affected: 0 };
 
-  db.exec('BEGIN TRANSACTION;');
+  const tx = await db.transaction();
   try {
     for (const s of students) {
-      db.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?').run(amount, now, s.id);
-      const bal = db.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(s.id).balance;
+      (await tx.prepare('UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?').run(amount, now, s.id));
+      const bal = (await tx.prepare('SELECT balance FROM wallets WHERE user_id = ?').get(s.id)).balance;
       const code = generatePixCode();
-      db.prepare(`
+      (await tx.prepare(`
         INSERT INTO transactions (code, type, from_user_id, to_user_id, amount, balance_after, note, created_at)
         VALUES (?, 'bulk', ?, ?, ?, ?, ?, ?)
-      `).run(code, adminId, s.id, amount, bal, note, now);
+      `).run(code, adminId, s.id, amount, bal, note, now));
     }
-    db.exec('COMMIT;');
+    await tx.commit();
 
     const targetDesc = classId ? `turma ID #${classId}` : 'todos os alunos da escola';
-    logAudit(adminId, 'bulk_reward', null, `Bônus coletivo de F$ ${amount} para ${students.length} alunos (${targetDesc}). Motivo: ${note}`);
+    await logAudit(adminId, 'bulk_reward', null, `Bônus coletivo de F$ ${amount} para ${students.length} alunos (${targetDesc}). Motivo: ${note}`);
     return { affected: students.length, amount };
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await tx.rollback();
     throw err;
   }
 }
 
-function getLeaderboard(classId = null) {
+async function getLeaderboard(classId = null) {
   let query = `
     SELECT u.id, u.username, u.name, u.active_frame, u.class_id, c.name as class_name, COALESCE(w.balance, 0) as balance
     FROM users u
@@ -724,24 +721,24 @@ function getLeaderboard(classId = null) {
     params.push(classId);
   }
   query += ` ORDER BY balance DESC, u.name ASC`;
-  const students = db.prepare(query).all(...params);
+  const students = (await db.prepare(query).all(...params));
 
-  return students.map(s => {
-    const sInfo = calculateStreaks(s.id);
+  return Promise.all(students.map(async s => {
+    const sInfo = await calculateStreaks(s.id);
     return {
       ...s,
       streak: sInfo.current,
       best_streak: sInfo.best
     };
-  });
+  }));
 }
 
-function getSystemStats() {
-  const totalInCirculation = db.prepare('SELECT SUM(balance) as total FROM wallets').get().total || 0;
-  const totalUsers = db.prepare('SELECT COUNT(*) as count FROM users WHERE role = \'aluno\'').get().count;
-  const totalTeachers = db.prepare('SELECT COUNT(*) as count FROM users WHERE role = \'teacher\'').get().count;
-  const totalTransactions = db.prepare('SELECT COUNT(*) as count FROM transactions').get().count;
-  const totalClasses = db.prepare('SELECT COUNT(*) as count FROM classes').get().count;
+async function getSystemStats() {
+  const totalInCirculation = (await db.prepare('SELECT SUM(balance) as total FROM wallets').get()).total || 0;
+  const totalUsers = (await db.prepare('SELECT COUNT(*) as count FROM users WHERE role = \'aluno\'').get()).count;
+  const totalTeachers = (await db.prepare('SELECT COUNT(*) as count FROM users WHERE role = \'teacher\'').get()).count;
+  const totalTransactions = (await db.prepare('SELECT COUNT(*) as count FROM transactions').get()).count;
+  const totalClasses = (await db.prepare('SELECT COUNT(*) as count FROM classes').get()).count;
 
   return {
     totalInCirculation,
@@ -755,10 +752,10 @@ function getSystemStats() {
 /* ========================================================
    Fisk Store & Profile Frames
    ======================================================== */
-function getStoreItems(userId) {
-  const items = db.prepare(`SELECT * FROM store_items WHERE category = 'frame' ORDER BY price ASC`).all();
-  const inventory = db.prepare(`SELECT item_id FROM user_inventory WHERE user_id = ?`).all(userId).map(i => i.item_id);
-  const user = getUserById(userId);
+async function getStoreItems(userId) {
+  const items = (await db.prepare(`SELECT * FROM store_items WHERE category = 'frame' ORDER BY price ASC`).all());
+  const inventory = (await db.prepare(`SELECT item_id FROM user_inventory WHERE user_id = ?`).all(userId)).map(i => i.item_id);
+  const user = await getUserById(userId);
 
   return items.map(it => ({
     ...it,
@@ -767,41 +764,41 @@ function getStoreItems(userId) {
   }));
 }
 
-function buyStoreItem(userId, itemId) {
+async function buyStoreItem(userId, itemId) {
   const now = Date.now();
-  db.exec('BEGIN TRANSACTION;');
+  const tx = await db.transaction();
   try {
-    const item = db.prepare(`SELECT * FROM store_items WHERE id = ?`).get(itemId);
+    const item = (await tx.prepare(`SELECT * FROM store_items WHERE id = ?`).get(itemId));
     if (!item) throw new Error('Moldura não encontrada na loja.');
 
-    const wallet = db.prepare(`SELECT balance FROM wallets WHERE user_id = ?`).get(userId);
+    const wallet = (await tx.prepare(`SELECT balance FROM wallets WHERE user_id = ?`).get(userId));
     if (!wallet || wallet.balance < item.price) {
       throw new Error(`Saldo insuficiente! Você tem F$ ${wallet.balance}, mas a moldura custa F$ ${item.price}.`);
     }
 
-    const alreadyOwned = db.prepare(`SELECT 1 FROM user_inventory WHERE user_id = ? AND item_id = ?`).get(userId, itemId);
+    const alreadyOwned = (await tx.prepare(`SELECT 1 FROM user_inventory WHERE user_id = ? AND item_id = ?`).get(userId, itemId));
     if (alreadyOwned) {
       throw new Error('Você já possui esta moldura em seu inventário.');
     }
 
     // Deduct balance
-    db.prepare(`UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE user_id = ?`).run(item.price, now, userId);
+    (await tx.prepare(`UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE user_id = ?`).run(item.price, now, userId));
 
     // Add to inventory
-    db.prepare(`INSERT INTO user_inventory (user_id, item_id, purchased_at) VALUES (?, ?, ?)`).run(userId, itemId, now);
+    (await tx.prepare(`INSERT INTO user_inventory (user_id, item_id, purchased_at) VALUES (?, ?, ?)`).run(userId, itemId, now));
 
     // Auto-equip
-    db.prepare(`UPDATE users SET active_frame = ? WHERE id = ?`).run(item.frame_css, userId);
+    (await tx.prepare(`UPDATE users SET active_frame = ? WHERE id = ?`).run(item.frame_css, userId));
 
     const newBalance = wallet.balance - item.price;
     const code = generatePixCode();
 
-    db.prepare(`
+    (await tx.prepare(`
       INSERT INTO transactions (code, type, from_user_id, to_user_id, amount, balance_after, note, created_at)
       VALUES (?, 'withdraw', ?, ?, ?, ?, ?, ?)
-    `).run(code, userId, userId, -item.price, newBalance, `Loja: ${item.name}`, now);
+    `).run(code, userId, userId, -item.price, newBalance, `Loja: ${item.name}`, now));
 
-    db.exec('COMMIT;');
+    await tx.commit();
 
     return {
       success: true,
@@ -810,29 +807,29 @@ function buyStoreItem(userId, itemId) {
       equipped: true
     };
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await tx.rollback();
     throw err;
   }
 }
 
-function equipFrame(userId, frameId) {
+async function equipFrame(userId, frameId) {
   if (frameId !== 'none') {
-    const owned = db.prepare(`
+    const owned = (await db.prepare(`
       SELECT 1 FROM user_inventory ui
       JOIN store_items si ON ui.item_id = si.id
       WHERE ui.user_id = ? AND si.frame_css = ?
-    `).get(userId, frameId);
+    `).get(userId, frameId));
     if (!owned) throw new Error('Você não possui esta moldura.');
   }
 
-  db.prepare(`UPDATE users SET active_frame = ? WHERE id = ?`).run(frameId, userId);
+  (await db.prepare(`UPDATE users SET active_frame = ? WHERE id = ?`).run(frameId, userId));
   return { success: true, active_frame: frameId };
 }
 
 /* ========================================================
    CSV / Excel Export Helpers
    ======================================================== */
-function exportAttendanceCSV(classId = null) {
+async function exportAttendanceCSV(classId = null) {
   let query = `
     SELECT a.date, u.name, u.username, COALESCE(c.name, 'Sem Turma') as class_name, 
            CASE WHEN a.status = 'p' THEN 'Presente (+F$ 3)' WHEN a.status = 'f' THEN 'Falta' ELSE 'Sem Registro' END as status_label
@@ -846,7 +843,7 @@ function exportAttendanceCSV(classId = null) {
     params.push(classId);
   }
   query += ` ORDER BY a.date DESC, u.name ASC`;
-  const rows = db.prepare(query).all(...params);
+  const rows = (await db.prepare(query).all(...params));
 
   let csv = '\uFEFFData;Nome do Aluno;Usuário;Turma;Status da Chamada\r\n';
   for (const r of rows) {
@@ -856,7 +853,7 @@ function exportAttendanceCSV(classId = null) {
   return csv;
 }
 
-function exportTransactionsCSV() {
+async function exportTransactionsCSV() {
   const query = `
     SELECT t.code, t.created_at, t.type, 
            COALESCE(u_from.name, 'Sistema Fisk') as from_name, 
@@ -866,7 +863,7 @@ function exportTransactionsCSV() {
     LEFT JOIN users u_to ON t.to_user_id = u_to.id
     ORDER BY t.created_at DESC
   `;
-  const rows = db.prepare(query).all();
+  const rows = (await db.prepare(query).all());
 
   let csv = '\uFEFFCódigo;Data e Hora;Tipo;Origem;Destino;Valor (F$);Saldo Após;Mensagem / Motivo\r\n';
   for (const r of rows) {
@@ -877,6 +874,7 @@ function exportTransactionsCSV() {
 }
 
 module.exports = {
+  initialize,
   db,
   getAllClasses,
   createClass,

@@ -1,7 +1,10 @@
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'fisk_pix_secure_jwt_token_2026_super_key';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 24 || JWT_SECRET.startsWith('TROQUE_')) {
+  throw new Error('Defina JWT_SECRET com pelo menos 24 caracteres no .env ou Render > Environment.');
+}
 const JWT_EXPIRES_IN = '7d';
 
 /**

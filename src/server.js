@@ -57,7 +57,7 @@ function generateSerial(username) {
 /* ========================================================
    Server-Sent Events Route
    ======================================================== */
-app.get('/api/events', authenticateToken, (req, res) => {
+app.get('/api/events', authenticateToken, async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -83,7 +83,7 @@ app.get('/api/events', authenticateToken, (req, res) => {
 /* ========================================================
    Authentication Routes
    ======================================================== */
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
@@ -92,26 +92,26 @@ app.post('/api/auth/login', (req, res) => {
 
   const rawUsername = String(username).trim();
 
-  const lock = db.checkLoginLock(rawUsername);
+  const lock = (await db.checkLoginLock(rawUsername));
   if (lock.locked) {
     return res.status(429).json({ 
       error: `Conta bloqueada temporariamente. Tente novamente em ${lock.remainingSeconds} segundos.` 
     });
   }
 
-  const user = db.getUserByUsername(rawUsername);
+  const user = (await db.getUserByUsername(rawUsername));
   if (!user) {
-    db.recordLoginFailure(rawUsername);
+    (await db.recordLoginFailure(rawUsername));
     return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
   }
 
   const passwordOk = verifyPassword(password, user.password_hash);
   if (!passwordOk) {
-    db.recordLoginFailure(rawUsername);
+    (await db.recordLoginFailure(rawUsername));
     return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
   }
 
-  db.clearLoginFailures(rawUsername);
+  (await db.clearLoginFailures(rawUsername));
 
   const token = generateToken({
     id: user.id,
@@ -120,7 +120,7 @@ app.post('/api/auth/login', (req, res) => {
     role: user.role
   });
 
-  const streaks = user.role === 'aluno' ? db.calculateStreaks(user.id) : null;
+  const streaks = user.role === 'aluno' ? (await db.calculateStreaks(user.id)) : null;
 
   res.json({
     token,
@@ -139,13 +139,13 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
-app.get('/api/auth/me', authenticateToken, (req, res) => {
-  const user = db.getUserById(req.user.id);
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  const user = (await db.getUserById(req.user.id));
   if (!user) {
     return res.status(404).json({ error: 'Usuário não encontrado.' });
   }
 
-  const streaks = user.role === 'aluno' ? db.calculateStreaks(user.id) : null;
+  const streaks = user.role === 'aluno' ? (await db.calculateStreaks(user.id)) : null;
 
   res.json({
     id: user.id,
@@ -161,23 +161,23 @@ app.get('/api/auth/me', authenticateToken, (req, res) => {
   });
 });
 
-app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 6) {
     return res.status(400).json({ error: 'A nova senha deve ter no mínimo 6 caracteres.' });
   }
 
-  db.updatePassword(req.user.id, newPassword);
+  (await db.updatePassword(req.user.id, newPassword));
   res.json({ message: 'Senha atualizada com sucesso no servidor!' });
 });
 
 /* ========================================================
    Wallet & Pix Routes (Students Only)
    ======================================================== */
-app.get('/api/wallet', authenticateToken, (req, res) => {
-  const user = db.getUserById(req.user.id);
-  const tx = db.getTransactions(req.user.id, 'all', 20);
-  const streaks = user.role === 'aluno' ? db.calculateStreaks(user.id) : null;
+app.get('/api/wallet', authenticateToken, async (req, res) => {
+  const user = (await db.getUserById(req.user.id));
+  const tx = (await db.getTransactions(req.user.id, 'all', 20));
+  const streaks = user.role === 'aluno' ? (await db.calculateStreaks(user.id)) : null;
 
   res.json({
     balance: user.balance,
@@ -188,13 +188,13 @@ app.get('/api/wallet', authenticateToken, (req, res) => {
   });
 });
 
-app.post('/api/pix/send', authenticateToken, (req, res) => {
+app.post('/api/pix/send', authenticateToken, async (req, res) => {
   const { toUserId, toUsername, amount, note } = req.body;
 
   let targetId = toUserId ? Number(toUserId) : null;
   if (!targetId && toUsername) {
     const cleanUser = String(toUsername).replace('@', '').trim();
-    const u = db.getUserByUsername(cleanUser);
+    const u = (await db.getUserByUsername(cleanUser));
     if (u) targetId = u.id;
   }
 
@@ -203,7 +203,7 @@ app.post('/api/pix/send', authenticateToken, (req, res) => {
   }
 
   try {
-    const receipt = db.transferPix(req.user.id, targetId, amount, note);
+    const receipt = (await db.transferPix(req.user.id, targetId, amount, note));
 
     broadcastToUser(targetId, 'pix_received', {
       from: receipt.from.name,
@@ -226,16 +226,16 @@ app.post('/api/pix/send', authenticateToken, (req, res) => {
   }
 });
 
-app.get('/api/pix/statement', authenticateToken, (req, res) => {
+app.get('/api/pix/statement', authenticateToken, async (req, res) => {
   const filter = req.query.filter || 'all';
   const limit = Math.min(Number(req.query.limit) || 50, 100);
-  const tx = db.getTransactions(req.user.id, filter, limit);
+  const tx = (await db.getTransactions(req.user.id, filter, limit));
   res.json({ transactions: tx });
 });
 
 app.get('/api/pix/qrcode/:username', authenticateToken, async (req, res) => {
   const username = req.params.username.trim();
-  const user = db.getUserByUsername(username);
+  const user = (await db.getUserByUsername(username));
   if (!user) {
     return res.status(404).json({ error: 'Usuário não encontrado.' });
   }
@@ -273,7 +273,7 @@ app.get('/api/pix/qrcode/:username', authenticateToken, async (req, res) => {
    ======================================================== */
 app.get('/api/cards/students', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const classId = req.query.classId ? Number(req.query.classId) : null;
-  const students = db.getAllUsers(classId, 'aluno');
+  const students = (await db.getAllUsers(classId, 'aluno'));
 
   try {
     const cards = [];
@@ -314,49 +314,49 @@ app.get('/api/cards/students', authenticateToken, requireRoles('teacher', 'admin
 /* ========================================================
    Classes Routes (Módulo de Múltiplas Turmas)
    ======================================================== */
-app.get('/api/classes', authenticateToken, (req, res) => {
+app.get('/api/classes', authenticateToken, async (req, res) => {
   // If teacher, can optionally filter by their classes, or see all
   const teacherFilter = req.user.role === 'teacher' && req.query.mine === 'true' ? req.user.id : null;
-  const classes = db.getAllClasses(teacherFilter);
+  const classes = (await db.getAllClasses(teacherFilter));
   res.json({ classes });
 });
 
-app.post('/api/classes', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.post('/api/classes', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const { name, level, teacherId } = req.body;
   if (!name) return res.status(400).json({ error: 'Nome da turma é obrigatório.' });
 
   try {
     const assignedTeacher = teacherId ? Number(teacherId) : (req.user.role === 'teacher' ? req.user.id : null);
-    const newClass = db.createClass(name, level, assignedTeacher);
-    db.logAudit(req.user.id, 'create_class', null, `Criou a turma "${name}" (${level || 'Geral'})`);
+    const newClass = (await db.createClass(name, level, assignedTeacher));
+    (await db.logAudit(req.user.id, 'create_class', null, `Criou a turma "${name}" (${level || 'Geral'})`));
     res.json({ success: true, class: newClass });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/api/classes/assign', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.post('/api/classes/assign', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const { userId, classId } = req.body;
-  db.assignStudentClass(Number(userId), classId ? Number(classId) : null);
-  db.logAudit(req.user.id, 'assign_student', Number(userId), `Atribuiu aluno à turma ID #${classId || 'Nenhuma'}`);
+  (await db.assignStudentClass(Number(userId), classId ? Number(classId) : null));
+  (await db.logAudit(req.user.id, 'assign_student', Number(userId), `Atribuiu aluno à turma ID #${classId || 'Nenhuma'}`));
   res.json({ success: true, message: 'Turma do aluno atualizada com sucesso!' });
 });
 
-app.post('/api/classes/set-teacher', authenticateToken, requireRoles('admin', 'coordenacao'), (req, res) => {
+app.post('/api/classes/set-teacher', authenticateToken, requireRoles('admin', 'coordenacao'), async (req, res) => {
   const { classId, teacherId } = req.body;
-  db.updateClassTeacher(Number(classId), teacherId ? Number(teacherId) : null);
-  db.logAudit(req.user.id, 'set_teacher', Number(teacherId), `Definiu professor da turma ID #${classId}`);
+  (await db.updateClassTeacher(Number(classId), teacherId ? Number(teacherId) : null));
+  (await db.logAudit(req.user.id, 'set_teacher', Number(teacherId), `Definiu professor da turma ID #${classId}`));
   res.json({ success: true, message: 'Professor atribuído à turma!' });
 });
 
 /* ========================================================
    Teacher Merit Awards
    ======================================================== */
-app.post('/api/teacher/award', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.post('/api/teacher/award', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const { studentId, amount, reason } = req.body;
 
   try {
-    const result = db.teacherAwardMerit(req.user.id, Number(studentId), amount, reason);
+    const result = (await db.teacherAwardMerit(req.user.id, Number(studentId), amount, reason));
 
     broadcastToUser(Number(studentId), 'pix_received', {
       from: req.user.name,
@@ -380,10 +380,10 @@ app.post('/api/teacher/award', authenticateToken, requireRoles('teacher', 'admin
 /* ========================================================
    Users & Directory Routes
    ======================================================== */
-app.get('/api/users/recipients', authenticateToken, (req, res) => {
+app.get('/api/users/recipients', authenticateToken, async (req, res) => {
   const classId = req.query.classId ? Number(req.query.classId) : null;
   // Students only can transfer to other students (teachers do not receive student peer-to-peer pix)
-  const users = db.getAllUsers(classId, 'aluno')
+  const users = (await db.getAllUsers(classId, 'aluno'))
     .filter(u => u.id !== req.user.id)
     .map(u => ({ 
       id: u.id, 
@@ -397,23 +397,23 @@ app.get('/api/users/recipients', authenticateToken, (req, res) => {
   res.json({ users });
 });
 
-app.get('/api/ranking', authenticateToken, (req, res) => {
+app.get('/api/ranking', authenticateToken, async (req, res) => {
   const classId = req.query.classId ? Number(req.query.classId) : null;
-  const leaderboard = db.getLeaderboard(classId);
+  const leaderboard = (await db.getLeaderboard(classId));
   res.json({ leaderboard });
 });
 
 /* ========================================================
    Attendance Routes
    ======================================================== */
-app.get('/api/attendance', authenticateToken, (req, res) => {
+app.get('/api/attendance', authenticateToken, async (req, res) => {
   const date = req.query.date || new Date().toISOString().split('T')[0];
   const classId = req.query.classId ? Number(req.query.classId) : null;
-  const list = db.getAttendanceForDate(date, classId);
+  const list = (await db.getAttendanceForDate(date, classId));
   res.json({ date, records: list });
 });
 
-app.post('/api/attendance/mark', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.post('/api/attendance/mark', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const { date, studentId, status } = req.body;
 
   if (!date || !studentId || !status) {
@@ -421,7 +421,7 @@ app.post('/api/attendance/mark', authenticateToken, requireRoles('teacher', 'adm
   }
 
   try {
-    const result = db.markAttendance(date, Number(studentId), status, req.user.id);
+    const result = (await db.markAttendance(date, Number(studentId), status, req.user.id));
 
     broadcastToUser(Number(studentId), 'attendance_updated', {
       date,
@@ -441,17 +441,17 @@ app.post('/api/attendance/mark', authenticateToken, requireRoles('teacher', 'adm
 /* ========================================================
    Fisk Store & Molduras Routes (Frames Only)
    ======================================================== */
-app.get('/api/store/items', authenticateToken, (req, res) => {
-  const items = db.getStoreItems(req.user.id);
+app.get('/api/store/items', authenticateToken, async (req, res) => {
+  const items = (await db.getStoreItems(req.user.id));
   res.json({ items });
 });
 
-app.post('/api/store/buy', authenticateToken, (req, res) => {
+app.post('/api/store/buy', authenticateToken, async (req, res) => {
   const { itemId } = req.body;
   if (!itemId) return res.status(400).json({ error: 'Moldura não informada.' });
 
   try {
-    const result = db.buyStoreItem(req.user.id, itemId);
+    const result = (await db.buyStoreItem(req.user.id, itemId));
 
     broadcastToUser(req.user.id, 'item_bought', {
       item: result.item,
@@ -468,10 +468,10 @@ app.post('/api/store/buy', authenticateToken, (req, res) => {
   }
 });
 
-app.post('/api/store/equip', authenticateToken, (req, res) => {
+app.post('/api/store/equip', authenticateToken, async (req, res) => {
   const { frameId } = req.body;
   try {
-    const result = db.equipFrame(req.user.id, frameId || 'none');
+    const result = (await db.equipFrame(req.user.id, frameId || 'none'));
     res.json({ success: true, message: 'Moldura atualizada!', result });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -481,27 +481,27 @@ app.post('/api/store/equip', authenticateToken, (req, res) => {
 /* ========================================================
    Admin & Coordenação Routes
    ======================================================== */
-app.get('/api/admin/stats', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.get('/api/admin/stats', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const classId = req.query.classId ? Number(req.query.classId) : null;
-  const stats = db.getSystemStats();
-  const users = db.getAllUsers(classId);
-  const teachers = db.getAllUsers(null, 'teacher');
-  const classes = db.getAllClasses();
-  const tx = db.getTransactions(null, 'all', 20);
+  const stats = (await db.getSystemStats());
+  const users = (await db.getAllUsers(classId));
+  const teachers = (await db.getAllUsers(null, 'teacher'));
+  const classes = (await db.getAllClasses());
+  const tx = (await db.getTransactions(null, 'all', 20));
 
   res.json({ stats, users, teachers, classes, recentTransactions: tx });
 });
 
-app.get('/api/coordenacao/audit', authenticateToken, requireRoles('admin', 'coordenacao'), (req, res) => {
-  const logs = db.getAuditLogs(100);
+app.get('/api/coordenacao/audit', authenticateToken, requireRoles('admin', 'coordenacao'), async (req, res) => {
+  const logs = (await db.getAuditLogs(100));
   res.json({ logs });
 });
 
-app.post('/api/admin/adjust', authenticateToken, requireRoles('admin', 'coordenacao'), (req, res) => {
+app.post('/api/admin/adjust', authenticateToken, requireRoles('admin', 'coordenacao'), async (req, res) => {
   const { kind, toUserId, amount, note } = req.body;
 
   try {
-    const result = db.adminAdjustBalance(kind, req.user.id, Number(toUserId), amount, note);
+    const result = (await db.adminAdjustBalance(kind, req.user.id, Number(toUserId), amount, note));
     broadcastToUser(Number(toUserId), 'balance_adjusted', { kind, amount, newBalance: result.newBalance });
     broadcastToAll('balance_updated', { users: [Number(toUserId)] });
 
@@ -511,11 +511,11 @@ app.post('/api/admin/adjust', authenticateToken, requireRoles('admin', 'coordena
   }
 });
 
-app.post('/api/admin/bulk-reward', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.post('/api/admin/bulk-reward', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const { amount, note, classId } = req.body;
 
   try {
-    const result = db.adminBulkReward(req.user.id, amount, note, classId ? Number(classId) : null);
+    const result = (await db.adminBulkReward(req.user.id, amount, note, classId ? Number(classId) : null));
     broadcastToAll('bulk_reward', { amount, note });
     res.json({ success: true, result, message: `Bônus de F$ ${amount} enviado a ${result.affected} alunos!` });
   } catch (err) {
@@ -523,7 +523,7 @@ app.post('/api/admin/bulk-reward', authenticateToken, requireRoles('teacher', 'a
   }
 });
 
-app.post('/api/admin/create-user', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.post('/api/admin/create-user', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const { username, name, password, role, classId } = req.body;
 
   if (!username || !name || !password || password.length < 6) {
@@ -537,8 +537,8 @@ app.post('/api/admin/create-user', authenticateToken, requireRoles('teacher', 'a
   }
 
   try {
-    const newUser = db.createUser(username, name, assignedRole, password, classId ? Number(classId) : null);
-    db.logAudit(req.user.id, 'create_user', newUser.id, `Cadastrou o ${assignedRole} "${name}" (@${username})`);
+    const newUser = (await db.createUser(username, name, assignedRole, password, classId ? Number(classId) : null));
+    (await db.logAudit(req.user.id, 'create_user', newUser.id, `Cadastrou o ${assignedRole} "${name}" (@${username})`));
     res.json({ success: true, user: newUser });
   } catch (err) {
     if (err.message && err.message.includes('UNIQUE')) {
@@ -549,17 +549,17 @@ app.post('/api/admin/create-user', authenticateToken, requireRoles('teacher', 'a
 });
 
 // Excel Exports
-app.get('/api/admin/export/attendance', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
+app.get('/api/admin/export/attendance', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const classId = req.query.classId ? Number(req.query.classId) : null;
-  const csvData = db.exportAttendanceCSV(classId);
+  const csvData = (await db.exportAttendanceCSV(classId));
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="fisk-chamada-frequencia.csv"');
   res.send(csvData);
 });
 
-app.get('/api/admin/export/transactions', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), (req, res) => {
-  const csvData = db.exportTransactionsCSV();
+app.get('/api/admin/export/transactions', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
+  const csvData = (await db.exportTransactionsCSV());
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="fisk-extrato-geral.csv"');
@@ -571,9 +571,11 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`=========================================`);
-  console.log(`🚀 Fisk Pix Server rodando na porta ${PORT}`);
-  console.log(`🔗 Acesse: http://localhost:${PORT}`);
-  console.log(`=========================================`);
+db.initialize().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🚀 Fisk Pix iniciado na porta ${PORT} (Turso/SQLite)`);
+  });
+}).catch(err => {
+  console.error('[DB] Falha ao iniciar o banco:', err.message);
+  process.exitCode = 1;
 });

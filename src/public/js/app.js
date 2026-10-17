@@ -533,7 +533,7 @@ async function render() {
         <div class="title">Fisk English School · Sistema Integrado</div>
         
         <label for="nick">Usuário</label>
-        <input id="nick" autocomplete="username" autocapitalize="none" placeholder="Coloque seu nickname Fisk (nota do dev eu realmente estava sem ideia doq colocar aqui)">
+        <input id="nick" autocomplete="username" autocapitalize="none" placeholder="Seu usuário Fisk">
         
         <label for="pw">Senha</label>
         <input id="pw" type="password" autocomplete="current-password" placeholder="Sua senha segura">
@@ -543,7 +543,7 @@ async function render() {
         
         <div class="legal">
           Falou Fisk, falou tudo! · Banco Digital & Gestão Pedagógica<br>
-          <small style="opacity:0.85">Acessos: Coordenação (Coordenação26@) · teacher (teacher123) · alunos: tyller, bia, cadu</small>
+          <small style="opacity:0.85">Acesse com a conta criada pela coordenação.</small>
         </div>
       </div>
     `;
