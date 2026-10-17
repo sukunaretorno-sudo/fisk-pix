@@ -533,7 +533,7 @@ async function render() {
         <div class="title">Fisk English School · Sistema Integrado</div>
         
         <label for="nick">Usuário</label>
-        <input id="nick" autocomplete="username" autocapitalize="none" placeholder="ex: tyller, teacher, Coordenação">
+        <input id="nick" autocomplete="username" autocapitalize="none" placeholder="Coloque seu nickname Fisk (nota do dev eu realmente estava sem ideia doq colocar aqui)">
         
         <label for="pw">Senha</label>
         <input id="pw" type="password" autocomplete="current-password" placeholder="Sua senha segura">
