@@ -20,9 +20,10 @@ function hashPassword(password) {
  * Verify a password against a stored salt:hash string
  */
 function verifyPassword(password, stored) {
-  if (!stored || !stored.includes(':')) return false;
+  if (typeof password !== 'string' || !stored || !stored.includes(':')) return false;
   const [salt, key] = stored.split(':');
   const keyBuffer = Buffer.from(key, 'hex');
+  if (keyBuffer.length !== 64) return false;
   const derivedKey = crypto.scryptSync(password, salt, 64);
   return crypto.timingSafeEqual(keyBuffer, derivedKey);
 }
@@ -37,7 +38,7 @@ function generateToken(payload) {
 /**
  * Express middleware to verify JWT
  */
-function authenticateToken(req, res, next) {
+async function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.startsWith('Bearer ') 
     ? authHeader.slice(7) 
@@ -47,13 +48,18 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: 'Acesso não autorizado. Faça login novamente.' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(403).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
+  let decoded;
+  try { decoded = jwt.verify(token, JWT_SECRET); }
+  catch { return res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' }); }
+  try {
+    // Lazy import avoids the password-hashing dependency cycle during startup.
+    const user = await require('./db').getUserById(decoded.id);
+    if (!user || !user.is_active || Number(decoded.token_version || 0) !== Number(user.token_version)) {
+      return res.status(401).json({ error: 'Seu acesso foi atualizado. Faça login novamente ou procure a coordenação.' });
     }
-    req.user = decoded;
+    req.user = user;
     next();
-  });
+  } catch (err) { next(err); }
 }
 
 /**

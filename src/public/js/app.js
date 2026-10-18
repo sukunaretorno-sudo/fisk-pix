@@ -1,14 +1,14 @@
 /**
- * Fisk Pix - Client Application (Production Frontend)
+ * Fisk Pay - Client Application
  * Distinct views for Students, Teachers & Pedagogical Coordination
  */
 
-const BADGE = `<svg viewBox="0 0 260 220" width="180" role="img" aria-label="Falou Fisk, falou tudo"><defs><path id="ta" d="M56,110 A74,74 0 0 1 204,110"/><path id="ba" d="M44,110 A86,86 0 0 0 216,110"/></defs><circle cx="130" cy="110" r="100" fill="none" style="stroke:var(--teal)" stroke-width="6"/><rect x="20" y="80" width="220" height="58" style="fill:var(--card)"/><text font-family="Archivo Black,Arial Black,sans-serif" font-size="23" text-anchor="middle" style="fill:var(--teal)"><textPath href="#ta" startOffset="50%">FALOU</textPath></text><text font-family="Archivo Black,Arial Black,sans-serif" font-size="23" text-anchor="middle" style="fill:var(--ba)" startOffset="50%">FALOU TUDO</textPath></text><text x="130" y="130" text-anchor="middle" font-family="Archivo Black,Arial Black,sans-serif" font-size="58" textLength="210" lengthAdjust="spacingAndGlyphs" style="fill:var(--teal)">FISK</text><text x="0" y="116" font-size="20" style="fill:var(--teal)">★</text><text x="238" y="116" font-size="20" style="fill:var(--teal)">★</text></svg>`;
+const BADGE = `<svg viewBox="0 0 260 220" width="180" role="img" aria-label="Falou Fisk, falou tudo"><defs><path id="ta" d="M56,110 A74,74 0 0 1 204,110"/><path id="ba" d="M44,110 A86,86 0 0 0 216,110"/></defs><circle cx="130" cy="110" r="100" fill="none" style="stroke:var(--teal)" stroke-width="6"/><rect x="20" y="80" width="220" height="58" style="fill:var(--card)"/><text font-family="Archivo Black,Arial Black,sans-serif" font-size="23" text-anchor="middle" style="fill:var(--teal)"><textPath href="#ta" startOffset="50%">FALOU</textPath></text><text font-family="Archivo Black,Arial Black,sans-serif" font-size="23" text-anchor="middle" style="fill:var(--teal)"><textPath href="#ba" startOffset="50%">FALOU TUDO</textPath></text><text x="130" y="130" text-anchor="middle" font-family="Archivo Black,Arial Black,sans-serif" font-size="58" textLength="210" lengthAdjust="spacingAndGlyphs" style="fill:var(--teal)">FISK</text><text x="0" y="116" font-size="20" style="fill:var(--teal)">★</text><text x="238" y="116" font-size="20" style="fill:var(--teal)">★</text></svg>`;
 const BUDDY_SRC = '/assets/buddy.jpg';
 
 const ROLE_LABELS = {
   aluno: 'Aluno',
-  admin: 'Administrador',
+  admin: 'Coordenação Pedagógica',
   teacher: 'Professor(a)',
   coordenacao: 'Coordenação Pedagógica'
 };
@@ -20,12 +20,16 @@ let pixSubMode = 'send'; // 'send' or 'qrcode'
 let pendingPix = null;
 let lastReceipt = null;
 let txFilter = 'all';
-let selectedClassId = ''; // '' for all classes
-let attendanceDate = new Date().toISOString().split('T')[0];
+let attendanceDate = localDate();
 let feedbackMsg = null;
 let eventSource = null;
 let isOnline = false;
 let userQrCode = null;
+let qrRequestToken = null;
+let pixSending = false;
+let bindGeneration = 0;
+let pixDraft = { key: '', recipient: '', amount: '', note: '' };
+let attendanceNote = '';
 
 const $ = sel => document.querySelector(sel);
 const fmt = n => 'F$ ' + Number(n).toLocaleString('pt-BR');
@@ -35,13 +39,13 @@ const when = t => new Date(t).toLocaleString('pt-BR', { day: '2-digit', month: '
 /* ========================================================
    Avatar with Profile Frame Renderer
    ======================================================== */
-function renderBuddy(frameClass = 'none', customStyle = '') {
+function renderBuddy(frameClass = 'none', customStyle = '', mascot = 'buddy') {
   const frame = frameClass || 'none';
   const hasCrown = frame === 'frame-crown';
   return `
-    <div class="buddy-container" style="${customStyle}">
+    <div class="buddy-container ${['buddy-celebrate', 'buddy-study'].includes(mascot) ? mascot : ''}" style="${customStyle}">
       ${hasCrown ? '<div class="crown-badge">👑</div>' : ''}
-      <img class="buddy ${esc(frame)}" alt="Buddy" src="${BUDDY_SRC}">
+      <img class="buddy ${esc(frame)} ${['buddy-celebrate', 'buddy-study'].includes(mascot) ? mascot : ''}" alt="Buddy" src="${BUDDY_SRC}">
     </div>
   `;
 }
@@ -99,6 +103,7 @@ function showToast(text, isPix = true) {
    API Client
    ======================================================== */
 async function api(endpoint, method = 'GET', body = null) {
+  const requestToken = authToken;
   const headers = { 'Content-Type': 'application/json' };
   if (authToken) {
     headers['Authorization'] = `Bearer ${authToken}`;
@@ -113,7 +118,7 @@ async function api(endpoint, method = 'GET', body = null) {
   const data = await res.json().catch(() => ({}));
 
   if (res.status === 401 || res.status === 403) {
-    if (authToken && endpoint !== '/api/auth/login') {
+    if (requestToken && requestToken === authToken && endpoint !== '/api/auth/login') {
       logout('Sua sessão expirou. Faça login novamente.');
       throw new Error(data.error || 'Sessão expirada');
     }
@@ -187,10 +192,16 @@ function updateOnlineBadge() {
 }
 
 async function refreshUserData() {
+  const token = authToken;
   try {
     const data = await api('/api/auth/me');
+    if (!currentUser || authToken !== token) return;
     currentUser = { ...currentUser, ...data };
-    render();
+    // Update the overview without discarding a form the user is completing.
+    const amount = $('.wallet-amount');
+    if (amount) amount.textContent = balanceHidden ? 'F$ ••••' : fmt(currentUser.balance);
+    const streak = $('.streak-card');
+    if (streak && currentUser.role === 'aluno') streak.outerHTML = streakHTML(currentUser.streaks);
   } catch (e) {}
 }
 
@@ -198,35 +209,29 @@ async function refreshUserData() {
    Auth Actions
    ======================================================== */
 async function doLogin() {
+  const button = $('#go');
+  if (!button || button.disabled) return;
   const username = $('#nick').value.trim();
   const password = $('#pw').value;
-
-  if (!username || !password) {
-    feedbackMsg = { t: 'Preencha usuário e senha.', k: 'bad' };
-    return render();
-  }
-
+  if (!username || !password) return showFeedback('Preencha seu usuário e sua senha.');
+  button.disabled = true;
+  button.textContent = 'Entrando…';
+  button.setAttribute('aria-busy', 'true');
   try {
     const data = await api('/api/auth/login', 'POST', { username, password });
     authToken = data.token;
     localStorage.setItem('fisk_token', authToken);
     currentUser = data.user;
     feedbackMsg = null;
-    
-    // Set appropriate initial tab based on role
-    if (currentUser.role === 'teacher') {
-      activeTab = 'att';
-    } else if (currentUser.role === 'coordenacao') {
-      activeTab = 'coord_classes';
-    } else {
-      activeTab = 'pix';
-    }
-
+    activeTab = currentUser.role === 'teacher' ? 'att' : ['coordenacao', 'admin'].includes(currentUser.role) ? 'coord_classes' : 'pix';
     connectSSE();
     render();
+    window.scrollTo(0, 0);
   } catch (err) {
-    feedbackMsg = { t: err.message, k: 'bad' };
-    render();
+    showFeedback(err.message === 'Failed to fetch' ? 'Não foi possível conectar. Verifique sua conexão e tente novamente.' : err.message);
+    button.disabled = false;
+    button.removeAttribute('aria-busy');
+    button.innerHTML = `Entrar na minha conta ${icon('arrow')}`;
   }
 }
 
@@ -240,8 +245,15 @@ function logout(customMessage = null) {
   localStorage.removeItem('fisk_token');
   pendingPix = null;
   lastReceipt = null;
+  userQrCode = null;
+  qrRequestToken = null;
+  pixDraft = { key: '', recipient: '', amount: '', note: '' };
+  attendanceNote = '';
+  isOnline = false;
+  pixSubMode = 'send';
   feedbackMsg = customMessage ? { t: customMessage, k: 'bad' } : null;
   render();
+  window.scrollTo(0, 0);
 }
 
 async function checkExistingSession() {
@@ -250,11 +262,12 @@ async function checkExistingSession() {
     currentUser = await api('/api/auth/me');
     if (currentUser.role === 'teacher' && activeTab === 'pix') {
       activeTab = 'att';
-    } else if (currentUser.role === 'coordenacao' && activeTab === 'pix') {
+    } else if (['coordenacao', 'admin'].includes(currentUser.role) && activeTab === 'pix') {
       activeTab = 'coord_classes';
     }
     connectSSE();
     render();
+    window.scrollTo(0, 0);
   } catch (err) {
     logout();
   }
@@ -264,12 +277,20 @@ async function checkExistingSession() {
    Pix Transfer Flow & QR Code (Students)
    ======================================================== */
 async function loadUserQrCode() {
-  if (userQrCode || !currentUser) return;
+  if (userQrCode || !currentUser || qrRequestToken === authToken) return;
+  const token = authToken;
+  const username = currentUser.username;
+  qrRequestToken = token;
   try {
-    const data = await api(`/api/pix/qrcode/${currentUser.username}`);
+    const data = await api(`/api/pix/qrcode/${encodeURIComponent(username)}`);
+    if (authToken !== token || currentUser?.username !== username) return;
     userQrCode = data;
-    render();
-  } catch (e) {}
+    if (activeTab === 'pix' && pixSubMode === 'qrcode') render();
+  } catch (e) {
+    if (authToken === token) showLoadError(e);
+  } finally {
+    if (qrRequestToken === token) qrRequestToken = null;
+  }
 }
 
 async function preparePix() {
@@ -280,19 +301,18 @@ async function preparePix() {
 
   if (directKeyInput && directKeyInput.value.trim()) {
     toUsername = directKeyInput.value.trim();
+    toUserId = null;
   }
 
-  const amount = parseInt($('#amt').value, 10);
+  const amount = Number($('#amt').value);
   const note = $('#note').value.trim().slice(0, 100);
 
-  if (!amount || amount < 1) {
-    feedbackMsg = { t: 'Informe um valor válido em Fisk Dollars.', k: 'bad' };
-    return render();
-  }
+  if (!Number.isSafeInteger(amount) || amount < 1) return showFeedback('Informe um valor inteiro maior que zero.');
+  if (amount > 10000) return showFeedback('O limite de envio é de F$ 10.000 por dia.');
+  if (!toUsername && !toUserId) return showFeedback('Digite uma chave Pix ou selecione um colega.');
 
   if (amount > currentUser.balance) {
-    feedbackMsg = { t: 'Saldo insuficiente para realizar este Pix.', k: 'bad' };
-    return render();
+    return showFeedback('Saldo insuficiente para realizar este Pix.');
   }
 
   let recipientName = '';
@@ -308,9 +328,13 @@ async function preparePix() {
 }
 
 async function confirmPix() {
-  if (!pendingPix) return;
+  if (!pendingPix || pixSending) return;
   const p = pendingPix;
-  pendingPix = null;
+  const token = authToken;
+  pixSending = true;
+  const button = $('#confirm-pix-btn');
+  if (button) { button.disabled = true; button.textContent = 'Enviando…'; }
+  if ($('#cancel-pix-btn')) $('#cancel-pix-btn').disabled = true;
 
   try {
     const res = await api('/api/pix/send', 'POST', {
@@ -320,14 +344,21 @@ async function confirmPix() {
       note: p.note
     });
 
+    if (authToken !== token || !currentUser) return;
+    pendingPix = null;
+    pixDraft = { key: '', recipient: '', amount: '', note: '' };
     currentUser.balance = res.receipt.new_balance;
     lastReceipt = res.receipt;
     playPixSound();
     feedbackMsg = { t: res.message, k: 'ok' };
     render();
   } catch (err) {
-    feedbackMsg = { t: err.message, k: 'bad' };
-    render();
+    if (authToken === token && currentUser) {
+      feedbackMsg = { t: err.message, k: 'bad' };
+      render();
+    }
+  } finally {
+    pixSending = false;
   }
 }
 
@@ -335,15 +366,20 @@ async function confirmPix() {
    Fisk Store & Molduras Actions
    ======================================================== */
 async function handleBuyItem(itemId, itemName, price) {
+  const token = authToken;
   if (currentUser.balance < price) {
     feedbackMsg = { t: `Saldo insuficiente para comprar ${itemName}!`, k: 'bad' };
     return render();
   }
 
+  const purchase = await confirmAction('Comprar personalização', `<p>Comprar <strong>${esc(itemName)}</strong> por <strong>${fmt(price)}</strong>?</p><p>Seu saldo após a compra: ${fmt(currentUser.balance - price)}.</p>`, 'Comprar e equipar', true);
+  if (!purchase || authToken !== token) return;
   try {
-    const res = await api('/api/store/buy', 'POST', { itemId });
+    const res = await api('/api/store/buy', 'POST', { itemId, note: purchase.note });
+    if (authToken !== token || !currentUser) return;
     currentUser.balance = res.result.newBalance;
-    currentUser.active_frame = res.result.item.frame_css;
+    if (res.result.item.category === 'theme') currentUser.active_theme = res.result.item.id;
+    else currentUser.active_frame = res.result.item.frame_css;
     playPixSound();
     showToast(`🎉 Parabéns! Você equipou a ${itemName}!`);
     feedbackMsg = { t: res.message, k: 'ok' };
@@ -355,8 +391,10 @@ async function handleBuyItem(itemId, itemName, price) {
 }
 
 async function handleEquipFrame(frameId) {
+  const token = authToken;
   try {
     await api('/api/store/equip', 'POST', { frameId });
+    if (authToken !== token || !currentUser) return;
     currentUser.active_frame = frameId;
     showToast(frameId === 'none' ? 'Moldura removida.' : 'Moldura equipada!');
     render();
@@ -374,7 +412,8 @@ async function markAttendance(studentId, status) {
     const res = await api('/api/attendance/mark', 'POST', {
       date: attendanceDate,
       studentId,
-      status
+      status,
+      note: attendanceNote
     });
 
     feedbackMsg = { 
@@ -390,10 +429,10 @@ async function markAttendance(studentId, status) {
 
 async function handleTeacherAward() {
   const studentId = $('#award_student').value;
-  const amount = parseInt($('#award_amt').value, 10);
+  const amount = Number($('#award_amt').value);
   const reason = $('#award_reason').value.trim();
 
-  if (!studentId || !amount || amount < 1) {
+  if (!studentId || !Number.isSafeInteger(amount) || amount < 1) {
     feedbackMsg = { t: 'Selecione o aluno e informe um valor válido.', k: 'bad' };
     return render();
   }
@@ -411,17 +450,19 @@ async function handleTeacherAward() {
 }
 
 async function handleBulkReward() {
-  const amount = parseInt($('#bulk_amt').value, 10);
+  const amount = Number($('#bulk_amt').value);
   const note = $('#bulk_reason').value.trim().slice(0, 100);
-  const classId = selectedClassId ? Number(selectedClassId) : null;
 
-  if (!amount || amount < 1) {
+  if (!Number.isSafeInteger(amount) || amount < 1) {
     feedbackMsg = { t: 'Informe um valor válido maior que zero.', k: 'bad' };
     return render();
   }
 
   try {
-    const res = await api('/api/admin/bulk-reward', 'POST', { amount, note, classId });
+    const { users } = await api('/api/users/recipients');
+    if (!users.length) return showFeedback('Nenhum aluno ativo para receber o bônus.');
+    if (!await confirmAction('Revisar bônus coletivo', `<p><strong>${users.length} alunos</strong> receberão <strong>${fmt(amount)} cada</strong>.</p><p>Total a distribuir: <strong>${fmt(amount * users.length)}</strong>.</p><p>Descrição: ${esc(note || 'Bônus coletivo')}</p>`, 'Confirmar distribuição')) return;
+    const res = await api('/api/admin/bulk-reward', 'POST', { amount, note });
     feedbackMsg = { t: res.message, k: 'ok' };
     render();
   } catch (err) {
@@ -431,10 +472,9 @@ async function handleBulkReward() {
 }
 
 async function handleCreateUser(forcedRole = 'aluno') {
-  const username = $('#nn').value.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
-  const name = $('#nm').value.trim().slice(0, 30);
+  const username = $('#nn').value.trim().toLowerCase();
+  const name = $('#nm').value.trim();
   const password = $('#ns').value;
-  const classId = $('#nc') ? $('#nc').value : null;
 
   if (!username || !name || password.length < 6) {
     feedbackMsg = { t: 'Preencha apelido, nome e senha com no mínimo 6 caracteres.', k: 'bad' };
@@ -442,7 +482,7 @@ async function handleCreateUser(forcedRole = 'aluno') {
   }
 
   try {
-    await api('/api/admin/create-user', 'POST', { username, name, password, role: forcedRole, classId });
+    await api('/api/admin/create-user', 'POST', { username, name, password, role: forcedRole, note: $('#new-student-note')?.value || '' });
     feedbackMsg = { t: `${forcedRole === 'teacher' ? 'Professor(a)' : 'Aluno(a)'} ${name} cadastrado(a)!`, k: 'ok' };
     render();
   } catch (err) {
@@ -451,46 +491,8 @@ async function handleCreateUser(forcedRole = 'aluno') {
   }
 }
 
-async function handleCreateClass() {
-  const name = $('#c_name').value.trim();
-  const level = $('#c_level').value.trim();
-  const teacherId = $('#c_teacher') ? $('#c_teacher').value : null;
-
-  if (!name) {
-    feedbackMsg = { t: 'Informe o nome da turma.', k: 'bad' };
-    return render();
-  }
-
-  try {
-    await api('/api/classes', 'POST', { name, level, teacherId });
-    feedbackMsg = { t: `Turma "${name}" criada com sucesso!`, k: 'ok' };
-    render();
-  } catch (err) {
-    feedbackMsg = { t: err.message, k: 'bad' };
-    render();
-  }
-}
-
-async function handleAssignTeacherToClass() {
-  const classId = $('#link_class').value;
-  const teacherId = $('#link_teacher').value;
-
-  if (!classId || !teacherId) {
-    feedbackMsg = { t: 'Selecione a turma e o professor.', k: 'bad' };
-    return render();
-  }
-
-  try {
-    await api('/api/classes/set-teacher', 'POST', { classId, teacherId });
-    feedbackMsg = { t: 'Professor vinculado à turma com sucesso!', k: 'ok' };
-    render();
-  } catch (err) {
-    feedbackMsg = { t: err.message, k: 'bad' };
-    render();
-  }
-}
-
 async function handleChangePassword() {
+  const token = authToken;
   const newPassword = $('#np').value;
   if (!newPassword || newPassword.length < 6) {
     feedbackMsg = { t: 'A senha precisa ter pelo menos 6 caracteres.', k: 'bad' };
@@ -499,6 +501,8 @@ async function handleChangePassword() {
 
   try {
     const res = await api('/api/auth/change-password', 'POST', { newPassword });
+    if (token !== authToken || !currentUser) return;
+    acceptSessionToken(res);
     $('#np').value = '';
     feedbackMsg = { t: res.message, k: 'ok' };
     render();
@@ -510,7 +514,7 @@ async function handleChangePassword() {
 
 function exportExcel(type) {
   const url = type === 'attendance'
-    ? `/api/admin/export/attendance?token=${encodeURIComponent(authToken)}&classId=${selectedClassId}`
+    ? `/api/admin/export/attendance?token=${encodeURIComponent(authToken)}`
     : `/api/admin/export/transactions?token=${encodeURIComponent(authToken)}`;
   window.location.href = url;
 }
@@ -521,37 +525,60 @@ function exportExcel(type) {
 async function render() {
   const app = $('#app');
   if (!app) return;
+  document.documentElement.dataset.storeTheme = currentUser?.active_theme || 'default';
 
-  // 1. Unauthenticated Login Screen
+  // The same account determines the available school tools after sign-in.
   if (!currentUser) {
+    app.className = 'login-page';
     app.innerHTML = `
-      <div class="note login">
-        <div style="display:flex;justify-content:center;align-items:center;gap:12px">
-          ${BADGE}
-          <img class="buddy" style="width:84px;height:84px" alt="Buddy" src="${BUDDY_SRC}">
-        </div>
-        <div class="title">Fisk English School · Sistema Integrado</div>
-        
-        <label for="nick">Usuário</label>
-        <input id="nick" autocomplete="username" autocapitalize="none" placeholder="Seu usuário Fisk">
-        
-        <label for="pw">Senha</label>
-        <input id="pw" type="password" autocomplete="current-password" placeholder="Sua senha segura">
-        
-        <button class="btn" id="go">Acessar Sistema Fisk</button>
-        <div class="msg ${feedbackMsg ? feedbackMsg.k : ''}">${feedbackMsg ? esc(feedbackMsg.t) : ''}</div>
-        
-        <div class="legal">
-          Falou Fisk, falou tudo! · Banco Digital & Gestão Pedagógica<br>
-          <small style="opacity:0.85">Acesse com a conta criada pela coordenação.</small>
-        </div>
-      </div>
-    `;
-
-    $('#go').onclick = doLogin;
-    $('#pw').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
+      <header class="login-header">
+        ${brandHTML()}
+        <button class="icon-button" id="toggle-theme-btn" aria-label="Alternar tema claro e escuro">${icon('sun')}</button>
+      </header>
+      <main class="login-layout" id="main-content">
+        <section class="login-story">
+          <div class="eyebrow"><span class="accent-dot"></span> SEU APRENDIZADO VALE MAIS</div>
+          <h1>Pequenas conquistas.<br><em>Grandes possibilidades.</em></h1>
+          <p>Aprenda, participe e conquiste Fisk Dollars. Seu progresso e o dia a dia na Fisk, juntos em um só lugar.</p>
+          <div class="login-benefits">
+            <div class="benefit"><span>${icon('pix')}</span><div><strong>Conecte-se com seus colegas</strong><p>Envie e receba Fisk Dollars com Pix.</p></div></div>
+            <div class="benefit"><span>${icon('star')}</span><div><strong>Cada conquista conta</strong><p>Ganhe méritos, mantenha sua sequência e evolua.</p></div></div>
+            <div class="benefit"><span>${icon('store')}</span><div><strong>Seu perfil, do seu jeito</strong><p>Troque suas conquistas por molduras para o Buddy.</p></div></div>
+          </div>
+          <div class="brand-seal">${BADGE}<span>Uma experiência feita<br>para a comunidade Fisk.</span></div>
+        </section>
+        <section class="login-panel" aria-labelledby="login-title">
+          <div class="login-card">
+            <div class="login-mascot">${renderBuddy()}</div>
+            <div class="eyebrow">BEM-VINDO AO FISK PAY</div>
+            <h2 id="login-title">Vamos nessa?</h2>
+            <p>Entre na sua conta e continue sua jornada.</p>
+            <form class="login-form" id="login-form">
+              <label for="nick">Seu usuário</label>
+              <div class="input-wrap">${icon('user')}<input id="nick" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="Digite seu usuário" required></div>
+              <label for="pw">Sua senha</label>
+              <div class="password-wrap"><input id="pw" type="password" autocomplete="current-password" placeholder="Digite sua senha" required><button type="button" id="toggle-password" class="icon-button" aria-label="Mostrar senha" aria-pressed="false">${icon('eye')}</button></div>
+              <div id="form-feedback" class="msg ${feedbackMsg ? feedbackMsg.k : ''}" role="status" aria-live="polite">${feedbackMsg ? esc(feedbackMsg.t) : ''}</div>
+              <button type="submit" class="btn" id="go">Entrar na minha conta ${icon('arrow')}</button>
+            </form>
+            <details class="login-help"><summary>Precisa de ajuda para entrar?</summary><p>Use o usuário e a senha fornecidos pela escola. Se esqueceu seu acesso, procure seu professor ou a coordenação.</p></details>
+            <div class="login-role-note">Alunos, professores e coordenação.<br>Um só acesso, cada um com seu espaço.</div>
+          </div>
+        </section>
+      </main>
+      <footer class="login-footer"><span>Fisk Pay · Conquistas que ensinam</span><span>Falou Fisk, falou tudo!</span></footer>`;
+    $('#login-form').onsubmit = e => { e.preventDefault(); doLogin(); };
+    $('#toggle-password').onclick = () => {
+      const visible = $('#pw').type === 'password';
+      $('#pw').type = visible ? 'text' : 'password';
+      $('#toggle-password').setAttribute('aria-label', visible ? 'Ocultar senha' : 'Mostrar senha');
+      $('#toggle-password').setAttribute('aria-pressed', String(visible));
+      $('#toggle-password').innerHTML = icon(visible ? 'eyeOff' : 'eye');
+    };
+    bindTheme();
     return;
   }
+  app.className = 'app-shell';
 
   // 2. Navigation Tabs based on Role
   let tabs = [];
@@ -566,100 +593,32 @@ async function render() {
     tabs = [
       ['att', 'Chamada 📝'],
       ['merit', 'Lançar Méritos ⭐'],
-      ['students', 'Turmas & Alunos 👥'],
+      ['students', 'Alunos 👥'],
       ['cards', 'Imprimir Cartões 💳'],
       ['reports', 'Relatórios 📥']
     ];
-  } else if (currentUser.role === 'coordenacao') {
+  } else if (['coordenacao', 'admin'].includes(currentUser.role)) {
     tabs = [
-      ['coord_classes', 'Turmas & Professores 🏫'],
+      ['coord_classes', 'Pessoas e Perfis 👥'],
       ['coord_audit', 'Auditoria dos Professores 📋'],
       ['cards', 'Imprimir Cartões 💳'],
       ['adm', 'Gestão Monetária 💰'],
       ['reports', 'Relatórios 📥']
     ];
-  } else {
-    // Admin (Cadu)
-    tabs = [
-      ['pix', 'Pix'],
-      ['store', 'Lojinha 🛍️'],
-      ['rank', 'Ranking'],
-      ['att', 'Chamada 📝'],
-      ['cards', 'Imprimir Cartões 💳'],
-      ['adm', 'Painel Master ⚙️'],
-      ['reports', 'Relatórios 📥']
-    ];
   }
 
-  // Header Card
-  let headerHTML = '';
+  const hasWallet = currentUser.role === 'aluno';
+  const headerHTML = hasWallet ? `
+    <section class="wallet-card" aria-label="Sua carteira Fisk">
+      <div class="wallet-top"><span class="wallet-brand">FISK <span>PAY</span></span><span class="wallet-tag">CARTEIRA DO ALUNO</span></div>
+      <div class="wallet-label">Saldo disponível <button id="toggle-balance-btn" class="icon-button" aria-label="${balanceHidden ? 'Mostrar' : 'Ocultar'} saldo" aria-pressed="${balanceHidden}">${icon(balanceHidden ? 'eyeOff' : 'eye')}</button></div>
+      <div class="wallet-amount">${balanceHidden ? 'F$ ••••' : fmt(currentUser.balance)}</div>
+      <div class="wallet-bottom"><div><span>SUA CHAVE PIX</span><strong>@${esc(currentUser.username)}</strong><small>${esc(currentUser.serial)}</small></div>${renderBuddy(currentUser.active_frame, '', currentUser.mascot)}</div>
+    </section>
+    ${streakHTML(currentUser.streaks)}
+  ` : `<section class="staff-welcome"><div><div class="eyebrow">${currentUser.role === 'teacher' ? 'ESPAÇO DO PROFESSOR' : 'COORDENAÇÃO PEDAGÓGICA'}</div><h2>Mais tempo para ensinar.<br>Mais espaço para evoluir.</h2><p>Alunos, frequência e conquistas em um só lugar.</p><div id="online-badge" class="status-badge"></div></div>${renderBuddy(currentUser.active_frame, '', currentUser.mascot)}</section>`;
 
-  if (currentUser.role === 'aluno' || currentUser.role === 'admin') {
-    // Banknote Card for Students
-    headerHTML = `
-      <div class="note">
-        <div class="top">
-          <div style="display:flex;align-items:center;gap:10px">
-            <div class="fisk">Fisk</div>
-            <div class="flag"></div>
-          </div>
-          <div style="text-align:right">
-            <div class="small">${ROLE_LABELS[currentUser.role]} ${currentUser.class_name ? `<span class="class-pill">${esc(currentUser.class_name)}</span>` : ''}</div>
-            <b>${esc(currentUser.name)}</b>
-            <div id="online-badge" class="status-badge">
-              <span class="status-dot ${isOnline ? '' : 'offline'}"></span>
-              ${isOnline ? 'Servidor Online' : 'Conectando...'}
-            </div>
-          </div>
-        </div>
-
-        <div class="title">Fisk Dollars · Saldo Disponível</div>
-        <div class="bal">
-          <b>${fmt(currentUser.balance)}</b>
-          ${renderBuddy(currentUser.active_frame)}
-        </div>
-        <div class="serial">
-          <span>${esc(currentUser.serial)}</span>
-          <span>Chave Pix: @${esc(currentUser.username)}</span>
-        </div>
-        <div class="legal">Falou Fisk, falou tudo! · Banco Digital Oficial da Turma</div>
-      </div>
-      ${currentUser.role === 'aluno' ? streakHTML(currentUser.streaks) : ''}
-    `;
-  } else {
-    // Teacher & Coordenação Administrative Header (No Banknote or personal Pix balance!)
-    headerHTML = `
-      <div class="note" style="border-color:var(--teal)">
-        <div class="top">
-          <div style="display:flex;align-items:center;gap:10px">
-            <div class="fisk">Fisk</div>
-            <div class="flag"></div>
-          </div>
-          <div style="text-align:right">
-            <div class="small" style="color:var(--teal);font-weight:bold">${ROLE_LABELS[currentUser.role]}</div>
-            <b>${esc(currentUser.name)}</b>
-            <div id="online-badge" class="status-badge">
-              <span class="status-dot ${isOnline ? '' : 'offline'}"></span>
-              ${isOnline ? 'Servidor Conectado' : 'Conectando...'}
-            </div>
-          </div>
-        </div>
-        <div class="title" style="margin-top:12px;font-size:14px">
-          ${currentUser.role === 'teacher' ? 'Painel Pedagógico do Professor' : 'Painel Geral da Coordenação Pedagógica'}
-        </div>
-        <div style="font-size:12px;text-align:center;color:var(--ink);margin-top:4px">
-          Ambiente administrativo · Gestão de turmas, frequência e méritos escolares
-        </div>
-      </div>
-    `;
-  }
-
-  // Navigation Tabs Bar
-  const tabsHTML = `
-    <div class="tabs">
-      ${tabs.map(t => `<button data-t="${t[0]}" class="${activeTab === t[0] ? 'on' : ''}">${t[1]}</button>`).join('')}
-    </div>
-  `;
+const tabsHTML = `<nav class="tabs" aria-label="Navegação principal">${tabs.map(t => `<button aria-label="${esc(NAV[t[0]]?.label || t[1])}" data-t="${t[0]}" class="${activeTab === t[0] ? 'on' : ''}" ${activeTab === t[0] ? 'aria-current="page"' : ''}><span class="nav-icon">${icon(NAV[t[0]]?.icon || 'grid')}</span><span class="nav-text" data-mobile-label="${esc(({coord_classes:'Pessoas',coord_audit:'Auditoria',cards:'Cartões',adm:'Saldos',ext:'Extrato'})[t[0]] || NAV[t[0]]?.label || t[1])}">${NAV[t[0]]?.label || esc(t[1])}</span>${icon('chevron')}</button>`).join('')}</nav>`;
 
   let tabContent = '<div class="empty">Carregando dados...</div>';
 
@@ -710,18 +669,18 @@ async function render() {
     } else if (pixSubMode === 'qrcode') {
       tabContent = `
         <div class="note">
-          <div style="display:flex;gap:6px;margin-bottom:12px">
-            <button class="btn alt" style="flex:1" id="submode-send">Enviar Pix 💸</button>
-            <button class="btn green" style="flex:1" id="submode-qr">Meu QR Code 📱</button>
+          <div class="segmented-control" aria-label="Tipo de operação Pix">
+            <button class="btn alt" style="flex:1" id="submode-send">${icon('send')} Enviar Pix</button>
+            <button class="btn green" style="flex:1" id="submode-qr">${icon('qr')} Receber Pix</button>
           </div>
-          <div class="title">Receber Fisk Pix via QR Code</div>
+          <div class="title">Receber Pix no Fisk Pay</div>
           <div class="qr-box">
             ${userQrCode && userQrCode.qrDataUrl 
               ? `<img src="${userQrCode.qrDataUrl}" alt="QR Code Pix">` 
               : '<div class="empty">Gerando QR Code...</div>'}
-            <div class="pix-key-pill" id="copy-key-btn">
-              <span>Chave: <b>@${esc(currentUser.username)}</b></span> 📋 Copiar
-            </div>
+            <button type="button" class="pix-key-pill" id="copy-key-btn">
+              <span>Chave: <b>@${esc(currentUser.username)}</b></span> Copiar chave
+            </button>
           </div>
           <div class="legal">Peça para seu colega escanear ou transferir para @${esc(currentUser.username)}</div>
         </div>
@@ -729,25 +688,29 @@ async function render() {
     } else {
       tabContent = `
         <div class="note">
-          <div style="display:flex;gap:6px;margin-bottom:12px">
-            <button class="btn green" style="flex:1" id="submode-send">Enviar Pix 💸</button>
-            <button class="btn alt" style="flex:1" id="submode-qr">Meu QR Code 📱</button>
+          <div class="segmented-control" aria-label="Tipo de operação Pix">
+            <button class="btn green" style="flex:1" id="submode-send">${icon('send')} Enviar Pix</button>
+            <button class="btn alt" style="flex:1" id="submode-qr">${icon('qr')} Receber Pix</button>
           </div>
-          <div class="title">Enviar Fisk Pix</div>
+          <div class="title">Enviar Pix no Fisk Pay</div>
           
-          <label for="direct-key">Chave Pix do Colega (@apelido)</label>
-          <input id="direct-key" placeholder="ex: @tyller ou @bia (ou selecione abaixo)">
+          <label for="direct-key">Para quem vamos enviar?</label>
+          <input id="direct-key" value="${esc(pixDraft.key)}" placeholder="@usuario" autocapitalize="none" spellcheck="false">
 
-          <label for="to">Ou Selecione na Turma</label>
+          <label for="recipient-search">Busque um colega</label>
+          <input id="recipient-search" type="search" placeholder="Nome ou @usuário" autocomplete="off">
+          <label for="to">Ou escolha um colega</label>
           <select id="to"><option value="">Carregando colegas...</option></select>
+          <small id="recipient-count" role="status"></small>
           
           <label for="amt">Valor em Fisk Dollars (F$)</label>
-          <input id="amt" type="number" min="1" step="1" inputmode="numeric" placeholder="Quanto deseja transferir?">
+          <input id="amt" value="${esc(pixDraft.amount)}" type="number" min="1" max="10000" step="1" inputmode="numeric" placeholder="Quanto deseja transferir?">
+          <small id="pix-limit" role="status">Limite de envio: F$ 10.000 por dia.</small>
           
           <label for="note">Mensagem ou Motivo (opcional)</label>
-          <input id="note" maxlength="100" placeholder="ex: Valeu pela ajuda no speaking!">
+          <input id="note" value="${esc(pixDraft.note)}" maxlength="100" placeholder="ex: Valeu pela ajuda no speaking!">
           
-          <button class="btn" id="send-btn">Revisar e Enviar Pix</button>
+          <button class="btn" id="send-btn">Revisar transferência ${icon('arrow')}</button>
         </div>
       `;
     }
@@ -759,11 +722,12 @@ async function render() {
   else if (activeTab === 'store') {
     tabContent = `
       <div class="note">
-        <div class="title">Lojinha de Molduras da Fisk 🛍️</div>
+        <div class="title">Sua coleção Fisk</div>
         <div style="text-align:center;font-size:13px;margin:6px 0;color:var(--ink)">
-          Seu saldo: <b>${fmt(currentUser.balance)}</b> · Destaque seu perfil com molduras animadas!
+          Seu saldo: <b>${fmt(currentUser.balance)}</b> · Escolha uma moldura ou transforme o app com um tema.
         </div>
-        <div id="store-container"><div class="empty">Carregando molduras...</div></div>
+        <div class="store-category-tabs" aria-label="Categorias da loja"><button class="btn alt" data-store-category="frame">Molduras</button><button class="btn alt" data-store-category="theme">Temas premium</button></div>
+        <div id="store-container"><div class="empty">Carregando coleção...</div></div>
       </div>
     `;
   }
@@ -775,7 +739,7 @@ async function render() {
     tabContent = `
       <div class="note">
         <div class='title'>Extrato de Movimentações</div>
-        <select id='flt'>
+        <label class="sr-only" for="flt">Filtrar movimentações</label><select id='flt'>
           <option value='all' ${txFilter === 'all' ? 'selected' : ''}>Todas as transações</option>
           <option value='in' ${txFilter === 'in' ? 'selected' : ''}>Apenas Recebidos</option>
           <option value='out' ${txFilter === 'out' ? 'selected' : ''}>Apenas Enviados</option>
@@ -791,9 +755,7 @@ async function render() {
   else if (activeTab === 'rank') {
     tabContent = `
       <div class="note">
-        <div class='title'>Ranking da Turma</div>
-        <label for="class-rank-filter">Filtrar Turma</label>
-        <select id="class-rank-filter"><option value="">Todas as Turmas</option></select>
+        <div class='title'>Ranking dos Alunos</div>
         <div id="leaderboard-list"><div class="empty">Carregando classificação...</div></div>
       </div>
     `;
@@ -806,16 +768,16 @@ async function render() {
     tabContent = `
       <div class='note'>
         <div class='title'>Chamada de Aula · +F$ 3 por presença</div>
-        <div style="display:flex;gap:8px;margin-bottom:8px">
-          <div style="flex:1">
+        <div style="margin-bottom:8px">
+          <div>
             <label for='ad'>Data da aula</label>
             <input id='ad' type='date' value='${attendanceDate}'>
           </div>
-          <div style="flex:1">
-            <label for='class-att-filter'>Turma</label>
-            <select id='class-att-filter'><option value=''>Todas as Turmas</option></select>
-          </div>
         </div>
+        <label for="attendance-note">Descrição da chamada (opcional)</label>
+        <input id="attendance-note" maxlength="100" value="${esc(attendanceNote)}" placeholder="ex: Aula de conversação">
+        <button class="btn alt" id="attendance-all-btn">Marcar todos como presentes</button>
+        <p class="field-hint">Alunos já presentes não recebem a recompensa novamente.</p>
         <div id="attendance-list"><div class="empty">Carregando alunos...</div></div>
       </div>
     `;
@@ -834,52 +796,50 @@ async function render() {
         <label for="award_amt">Quantidade de Fisk Dollars (F$)</label>
         <input id="award_amt" type="number" min="1" step="1" placeholder="ex: 5, 10, 15">
 
-        <label for="award_reason">Motivo Pedagógico / Elogio</label>
+        <label for="award_reason">Descrição / elogio (opcional)</label>
         <input id="award_reason" placeholder="ex: Excelente speaking no diálogo da lição 4">
 
         <button class="btn green" id="award-btn">Lançar Prêmio de Mérito</button>
       </div>
 
       <div class='note'>
-        <div class='title'>Bônus Coletivo para a Turma Inteira</div>
+        <div class='title'>Bônus Coletivo para Todos os Alunos</div>
         <label for="bulk_amt">Valor em Fisk Dollars para cada aluno (F$)</label>
         <input id='bulk_amt' type='number' min='1' step='1' placeholder='ex: 10'>
 
-        <label for='bulk_reason'>Motivo do Bônus</label>
-        <input id='bulk_reason' placeholder='ex: 100% da turma entregou o homework!'>
+        <label for='bulk_reason'>Descrição do bônus (opcional)</label>
+        <input id='bulk_reason' placeholder='ex: Excelente participação no evento!'>
 
-        <button class='btn alt' id='bulk-btn'>Distribuir Bônus para Alunos da Turma Selecionada</button>
+        <button class='btn alt' id='bulk-btn'>Distribuir Bônus para Todos os Alunos</button>
       </div>
     `;
   }
 
   /* ========================================================
-     Tab: TURMAS & ALUNOS (Teacher)
+     Tab: ALUNOS (Teacher)
      ======================================================== */
   else if (activeTab === 'students') {
     tabContent = `
       <div class="note">
-        <div class="title">Alunos Matriculados</div>
-        <label for="students-class-filter">Filtrar por Turma</label>
-        <select id="students-class-filter"><option value="">Todas as Turmas</option></select>
+        <div class="title">Alunos Cadastrados</div>
         <div class="scroll">
           <table id="teacher-students-table">
-            <tr><th>Aluno</th><th>Turma</th><th>Saldo</th></tr>
+            <tr><th>Aluno</th><th>Usuário</th><th>Saldo</th></tr>
           </table>
         </div>
       </div>
 
       <div class='note'>
-        <div class='title'>Matricular Novo Aluno na Turma</div>
+        <div class='title'>Cadastrar Novo Aluno</div>
         <label for='nn'>Apelido (login)</label>
         <input id='nn' autocapitalize='none' placeholder='ex: pedro'>
         <label for='nm'>Nome completo</label>
         <input id='nm' placeholder='ex: Pedro Santos'>
-        <label for='nc'>Turma</label>
-        <select id='nc'><option value=''>Selecione a turma...</option></select>
         <label for='ns'>Senha inicial (mín. 6)</label>
         <input id='ns' type='password' autocomplete='new-password'>
-        <button class='btn' id='create-student-btn'>Cadastrar e Matricular Aluno</button>
+        <label for='new-student-note'>Descrição do cadastro (opcional)</label>
+        <input id='new-student-note' maxlength='100' placeholder='ex: Novo acesso'>
+        <button class='btn' id='create-student-btn'>Cadastrar Aluno</button>
       </div>
     `;
   }
@@ -895,10 +855,7 @@ async function render() {
           Gere carteirinhas prontas para imprimir e plastificar no formato cartão de crédito (CR80) com QR Code Pix!
         </div>
         
-        <label for="cards-class-filter">Selecione a Turma para Impressão</label>
-        <select id="cards-class-filter"><option value="">Todas as Turmas</option></select>
-
-        <button class="btn green" id="print-now-btn" style="margin-top:14px">🖨️ Imprimir Cartões da Turma</button>
+        <button class="btn green" id="print-now-btn" style="margin-top:14px">🖨️ Imprimir Cartões dos Alunos</button>
       </div>
 
       <div class="note" id="print-section">
@@ -911,52 +868,10 @@ async function render() {
   }
 
   /* ========================================================
-     Tab: COORDENAÇÃO - TURMAS & PROFESSORES
+     Tab: COORDENAÇÃO - PESSOAS E PERFIS
      ======================================================== */
   else if (activeTab === 'coord_classes') {
-    tabContent = `
-      <div class="note">
-        <div class="title">Turmas & Professores Atribuídos</div>
-        <div class="scroll">
-          <table id="classes-table">
-            <tr><th>Turma</th><th>Nível</th><th>Professor(a)</th><th>Qtd. Alunos</th></tr>
-          </table>
-        </div>
-      </div>
-
-      <div class="note">
-        <div class="title">Atribuir Professor a uma Turma</div>
-        <label for="link_class">Selecione a Turma</label>
-        <select id="link_class"><option value="">Carregando turmas...</option></select>
-
-        <label for="link_teacher">Selecione o Professor(a)</label>
-        <select id="link_teacher"><option value="">Carregando professores...</option></select>
-
-        <button class="btn green" id="link-teacher-btn">Salvar Atribuição</button>
-      </div>
-
-      <div class='note'>
-        <div class='title'>Cadastrar Novo Professor(a)</div>
-        <label for='t_username'>Usuário do Professor</label>
-        <input id='t_username' autocapitalize='none' placeholder='ex: teacher_ana'>
-        <label for='t_name'>Nome do Professor(a)</label>
-        <input id='t_name' placeholder='ex: Teacher Ana Paula'>
-        <label for='t_password'>Senha inicial (mín. 6)</label>
-        <input id='t_password' type='password' autocomplete='new-password'>
-        <button class='btn alt' id='create-teacher-btn'>Cadastrar Professor(a)</button>
-      </div>
-
-      <div class='note'>
-        <div class='title'>Cadastrar Nova Turma</div>
-        <label for='c_name'>Nome da Turma</label>
-        <input id='c_name' placeholder='ex: Teens 2'>
-        <label for='c_level'>Nível (opcional)</label>
-        <input id='c_level' placeholder='ex: Intermediário'>
-        <label for='c_teacher'>Professor(a) Responsável</label>
-        <select id='c_teacher'><option value=''>Sem professor por enquanto</option></select>
-        <button class='btn alt' id='create-class-btn'>Criar Turma</button>
-      </div>
-    `;
+    tabContent = peoplePageHTML();
   }
 
   /* ========================================================
@@ -965,13 +880,13 @@ async function render() {
   else if (activeTab === 'coord_audit') {
     tabContent = `
       <div class="note">
-        <div class="title">Histórico de Auditoria dos Professores 📋</div>
+        <div class="title">Histórico de atividades</div>
         <div style="font-size:12px;text-align:center;color:var(--ink);margin:6px 0">
-          Registro em tempo real de todas as ações pedagógicas e financeiras realizadas pelo corpo docente.
+          Cadastros, acessos, ações pedagógicas e ajustes de saldo registrados em um só lugar.
         </div>
         <div class="scroll">
           <table id="audit-table">
-            <tr><th>Data/Hora</th><th>Professor(a)</th><th>Ação</th><th>Aluno</th><th>Detalhes</th></tr>
+            <tr><th>Data/Hora</th><th>Responsável</th><th>Ação</th><th>Pessoa</th><th>Descrição</th></tr>
           </table>
         </div>
       </div>
@@ -987,7 +902,7 @@ async function render() {
         <div class="title" id="economy-title">Estatísticas Gerais do Banco Fisk</div>
         <div class="scroll">
           <table id="accounts-table">
-            <tr><th>Usuário</th><th>Turma</th><th>Função</th><th>Saldo</th></tr>
+            <tr><th>Usuário</th><th>Perfil</th><th>Saldo</th></tr>
           </table>
         </div>
         <h3 style="margin-top:16px">Últimas 15 movimentações no sistema</h3>
@@ -1018,38 +933,37 @@ async function render() {
      Tab: RELATÓRIOS EXCEL
      ======================================================== */
   else if (activeTab === 'reports') {
-    tabContent = `
-      <div class="note">
-        <div class="title">Exportação de Planilhas para Excel (.csv) 📊</div>
-        <div style="font-size:12px;text-align:center;color:var(--ink);margin:8px 0">
-          Gere relatórios oficiais com suporte nativo a acentuação para Microsoft Excel.
-        </div>
-        <button class="btn green" id="export-att-btn">📥 Exportar Frequência da Turma para Excel</button>
-        <button class="btn alt" id="export-tx-btn">📥 Exportar Livro Geral de Transações</button>
-      </div>
-    `;
+    tabContent = reportsPageHTML();
   }
 
-  // Footer Actions
-  const footerHTML = `
-    <div class="msg ${feedbackMsg ? feedbackMsg.k : ''}">${feedbackMsg ? esc(feedbackMsg.t) : ''}</div>
-    
-    <details class='note'>
-      <summary class='small' style='cursor:pointer'>Alterar minha senha</summary>
-      <label for='np'>Nova senha segura (mínimo 6 caracteres)</label>
-      <input id='np' type='password' autocomplete='new-password'>
-      <button class='btn alt' id='chpw-btn'>Salvar Nova Senha</button>
-    </details>
-
-    <button class='btn alt' id='toggle-theme-btn' style='margin:4px 8px;width:calc(100% - 16px)'>
-      Alternar Tema Claro / Escuro
-    </button>
-    <button class="btn alt" id="logout-btn" style="margin:4px 7px;width:calc(100% - 14px);color:var(--bad);border-color:var(--bad)">
-      Sair da Conta (${esc(currentUser.name)})
-    </button>
-  `;
-
-  app.innerHTML = headerHTML + tabsHTML + tabContent + footerHTML;
+  const section = NAV[activeTab] || NAV.pix;
+  const firstName = currentUser.role === 'teacher' ? currentUser.name : currentUser.name.split(' ')[0];
+  const footerHTML = profileSettingsHTML() + `<details class="note account-settings"><summary>${icon('lock')} Segurança da conta <span>Alterar senha</span></summary><label for="np">Nova senha (mínimo 6 caracteres)</label><input id="np" type="password" autocomplete="new-password" minlength="6"><button class="btn alt" id="chpw-btn">Salvar nova senha</button></details><footer class="app-footer"><span>Fisk Pay · Juntos, a gente vai além.</span><span>Falou Fisk, falou tudo!</span></footer>`;
+  app.innerHTML = `
+    <aside class="sidebar">
+      ${brandHTML()}<div class="brand-caption">CONQUISTAS QUE ENSINAM</div>
+      <div class="nav-label">MEU ESPAÇO</div>${tabsHTML}
+      <div class="sidebar-bottom"><div class="sidebar-motto">Seu esforço.<br>Suas conquistas.<br><strong>Seu futuro.</strong></div><button class="icon-text-button" id="toggle-theme-btn" aria-label="Alternar tema">${icon('sun')}<span>Alternar tema</span></button><button class="icon-text-button" id="logout-btn" aria-label="Sair da conta">${icon('logout')}<span>Sair da conta</span></button></div>
+    </aside>
+    <main class="main-area" id="main-content">
+      <header class="workspace-header"><div><div class="eyebrow">${hasWallet ? 'SUA JORNADA FISK' : 'GESTÃO PEDAGÓGICA'}</div><h1>Olá, ${esc(firstName)} <span class="greeting-wave">✦</span></h1></div><button type="button" class="user-chip" id="open-profile-btn" aria-label="Editar meu perfil"><span class="user-initials">${esc(currentUser.name.split(' ').map(n => n[0]).slice(0,2).join(''))}</span><div><strong>${esc(currentUser.name)}</strong><small>${esc(ROLE_LABELS[currentUser.role])}</small></div></button></header>
+      <div class="workspace-body">
+        <div class="overview-grid ${hasWallet ? '' : 'staff-overview'}">${headerHTML}</div>
+        <div class="content-heading"><div><h2 tabindex="-1">${section.title}</h2><p>${section.description}</p></div>${hasWallet ? `<span class="status-badge" ${currentUser.role === 'aluno' ? 'id="online-badge"' : ''}><span class="status-dot ${isOnline ? '' : 'offline'}"></span>${isOnline ? 'Conectado' : 'Conectando'}</span>` : ''}</div>
+        <div id="form-feedback" class="msg ${feedbackMsg ? feedbackMsg.k : ''}" role="status" aria-live="polite">${feedbackMsg ? esc(feedbackMsg.t) : ''}</div>
+        <div class="content-grid ${activeTab === 'pix' ? 'with-context' : ''}"><section class="primary-content" aria-label="${section.title}">${tabContent}</section>${activeTab === 'pix' ? `<aside class="context-panel"><section class="tip-card buddy-tip"><div class="eyebrow">BUDDY TE LEMBRA</div><h3>Aprender também<br>é compartilhar.</h3><p>Ajuda no speaking, parceria no homework… um Pix pode dizer “valeu”!</p><div class="tip-footer">${renderBuddy()}<span>Good vibes.<br><strong>Great learning.</strong></span></div></section><section class="tip-card"><span class="tip-icon">${icon('shield')}</span><h3>Confira antes de enviar</h3><p>Revise o colega e o valor na próxima etapa. Sua chave é o seu @usuário.</p></section></aside>` : ''}</div>
+        ${footerHTML}
+      </div>
+    </main>`;
+  updateOnlineBadge();
+  if ($('#toggle-balance-btn')) $('#toggle-balance-btn').onclick = () => {
+    balanceHidden = !balanceHidden;
+    localStorage.setItem('fisk_hide_balance', String(balanceHidden));
+    $('.wallet-amount').textContent = balanceHidden ? 'F$ ••••' : fmt(currentUser.balance);
+    $('#toggle-balance-btn').innerHTML = icon(balanceHidden ? 'eyeOff' : 'eye');
+    $('#toggle-balance-btn').setAttribute('aria-label', balanceHidden ? 'Mostrar saldo' : 'Ocultar saldo');
+    $('#toggle-balance-btn').setAttribute('aria-pressed', String(balanceHidden));
+  };
   bindEvents();
 }
 
@@ -1057,14 +971,21 @@ async function render() {
    Event Binding & Data Loaders
    ======================================================== */
 async function bindEvents() {
+  const generation = ++bindGeneration;
+  const token = authToken;
+  const tab = activeTab;
+  const isCurrentView = () => generation === bindGeneration && token === authToken && tab === activeTab;
   // Navigation Tabs
   document.querySelectorAll('[data-t]').forEach(b => {
-    b.onclick = () => {
+    b.onclick = async () => {
+      if (activeTab === b.dataset.t) return;
       activeTab = b.dataset.t;
       pendingPix = null;
       lastReceipt = null;
       feedbackMsg = null;
-      render();
+      await render();
+      $('.content-heading h2')?.focus({ preventScroll: true });
+      window.scrollTo(0, 0);
     };
   });
 
@@ -1072,15 +993,8 @@ async function bindEvents() {
   const outBtn = $('#logout-btn');
   if (outBtn) outBtn.onclick = () => logout();
 
-  // Theme toggle
-  const themeBtn = $('#toggle-theme-btn');
-  if (themeBtn) {
-    themeBtn.onclick = () => {
-      const root = document.documentElement;
-      const isDark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
-      root.dataset.theme = isDark ? 'light' : 'dark';
-    };
-  }
+  bindTheme();
+  bindProfileSettings();
 
   // Change password
   const chpwBtn = $('#chpw-btn');
@@ -1089,11 +1003,12 @@ async function bindEvents() {
   /* Tab: Pix (Students) */
   if (activeTab === 'pix') {
     const sendSubBtn = $('#submode-send');
-    if (sendSubBtn) sendSubBtn.onclick = () => { pixSubMode = 'send'; render(); };
+    if (sendSubBtn) sendSubBtn.onclick = () => { pixSubMode = 'send'; feedbackMsg = null; render(); };
 
     const qrSubBtn = $('#submode-qr');
     if (qrSubBtn) qrSubBtn.onclick = () => {
       pixSubMode = 'qrcode';
+      feedbackMsg = null;
       loadUserQrCode();
       render();
     };
@@ -1102,9 +1017,11 @@ async function bindEvents() {
       loadUserQrCode();
       const copyBtn = $('#copy-key-btn');
       if (copyBtn) {
-        copyBtn.onclick = () => {
-          navigator.clipboard.writeText(`@${currentUser.username}`);
-          showToast(`Chave @${currentUser.username} copiada!`);
+        copyBtn.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(`@${currentUser.username}`);
+            showToast(`Chave @${currentUser.username} copiada!`);
+          } catch { showToast(`Copie sua chave: @${currentUser.username}`, false); }
         };
       }
     } else if (lastReceipt) {
@@ -1122,68 +1039,24 @@ async function bindEvents() {
     } else {
       const sendBtn = $('#send-btn');
       if (sendBtn) sendBtn.onclick = preparePix;
+      for (const [id, key] of [['direct-key', 'key'], ['to', 'recipient'], ['amt', 'amount'], ['note', 'note']]) {
+        const field = document.getElementById(id);
+        if (field) field.oninput = () => { pixDraft[key] = field.value; };
+      }
 
       try {
         const { users } = await api('/api/users/recipients');
-        const sel = $('#to');
-        if (sel) {
-          sel.innerHTML = users.map(u => `
-            <option value="${u.id}">${esc(u.name)} (@${esc(u.username)})${u.class_name ? ` · ${esc(u.class_name)}` : ''}</option>
-          `).join('');
-        }
-      } catch (e) {}
+      if (!isCurrentView()) return;
+        bindRecipientSearch(users);
+        const limit = await api('/api/pix/limit');
+        if (isCurrentView() && $('#pix-limit')) $('#pix-limit').textContent = `${fmt(limit.remaining)} disponíveis para envio hoje · limite de ${fmt(limit.limit)}/dia.`;
+      } catch (e) { if (isCurrentView()) showLoadError(e); }
     }
   }
 
-  /* Tab: Store (Frames Only) */
+  /* Tab: Store */
   if (activeTab === 'store') {
-    try {
-      const { items } = await api('/api/store/items');
-      const storeContainer = $('#store-container');
-      if (storeContainer) {
-        storeContainer.innerHTML = `
-          <div class="store-grid">
-            ${items.map(it => {
-              let actionBtn = '';
-              if (it.equipped) {
-                actionBtn = `<button class="store-btn equipped">Equipada</button>`;
-              } else if (it.owned) {
-                actionBtn = `<button class="store-btn owned" data-equip="${it.frame_css}">Equipar</button>`;
-              } else {
-                actionBtn = `<button class="store-btn" data-buy="${it.id}" data-name="${esc(it.name)}" data-price="${it.price}">Comprar</button>`;
-              }
-
-              return `
-                <div class="store-card">
-                  <div class="store-header">
-                    <div class="store-icon">${it.icon || '🖼️'}</div>
-                    <span class="store-category">Moldura VIP</span>
-                  </div>
-                  <div class="store-title">${esc(it.name)}</div>
-                  <div class="store-desc">${esc(it.description)}</div>
-                  <div style="text-align:center;margin:8px 0">
-                    <small style="display:block;margin-bottom:4px;color:var(--ink)">Preview no Buddy:</small>
-                    ${renderBuddy(it.frame_css, 'transform:scale(0.85);margin:0 auto;')}
-                  </div>
-                  <div class="store-footer">
-                    <div class="store-price">${fmt(it.price)}</div>
-                    ${actionBtn}
-                  </div>
-                </div>
-              `;
-            }).join('')}
-          </div>
-        `;
-
-        document.querySelectorAll('[data-buy]').forEach(b => {
-          b.onclick = () => handleBuyItem(b.dataset.buy, b.dataset.name, Number(b.dataset.price));
-        });
-
-        document.querySelectorAll('[data-equip]').forEach(b => {
-          b.onclick = () => handleEquipFrame(b.dataset.equip);
-        });
-      }
-    } catch (e) {}
+    await loadStore(isCurrentView);
   }
 
   /* Tab: Extrato (Students) */
@@ -1198,6 +1071,7 @@ async function bindEvents() {
 
     try {
       const { transactions } = await api(`/api/pix/statement?filter=${txFilter}`);
+      if (!isCurrentView()) return;
       const listEl = $('#statement-list');
       if (listEl) {
         if (!transactions.length) {
@@ -1218,8 +1092,10 @@ async function bindEvents() {
               title = `Mérito de ${esc(tx.from_name || 'Teacher')}`;
             } else if (tx.type === 'bulk') {
               title = `Bônus da Escola`;
+            } else if (tx.type === 'withdraw' && tx.note?.startsWith('Loja:')) {
+              title = 'Compra na loja';
             } else {
-              title = `Compra de Moldura na Loja`;
+              title = ACTION_LABELS[tx.type] || 'Ajuste de saldo';
             }
 
             return `
@@ -1235,29 +1111,14 @@ async function bindEvents() {
           }).join('');
         }
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
   /* Tab: Ranking */
   if (activeTab === 'rank') {
-    const classFilter = $('#class-rank-filter');
-    if (classFilter) {
-      classFilter.onchange = () => {
-        selectedClassId = classFilter.value;
-        bindEvents();
-      };
-    }
-
     try {
-      const [rankRes, classesRes] = await Promise.all([
-        api(`/api/ranking?classId=${selectedClassId}`),
-        api('/api/classes')
-      ]);
-
-      if (classFilter && classFilter.children.length <= 1) {
-        classFilter.innerHTML = `<option value="">Todas as Turmas</option>` +
-          classesRes.classes.map(c => `<option value="${c.id}" ${selectedClassId == c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
-      }
+      const rankRes = await api('/api/ranking');
+      if (!isCurrentView()) return;
 
       const rankEl = $('#leaderboard-list');
       if (rankEl) {
@@ -1268,10 +1129,9 @@ async function bindEvents() {
           <div class="row">
             <div style="display:flex;align-items:center;gap:8px">
               <span style="font-weight:bold">${['🥇', '🥈', '🥉'][idx] || (idx + 1) + 'º'}</span>
-              ${renderBuddy(s.active_frame, 'transform:scale(0.5);width:34px;height:34px;margin-right:2px')}
+              ${renderBuddy(s.active_frame, 'transform:scale(0.5);width:34px;height:34px;margin-right:2px', s.mascot)}
               <div>
                 <b>${esc(s.name)}</b> <small style="display:inline">(@${esc(s.username)})</small>
-                ${s.class_name ? `<span class="class-pill">${esc(s.class_name)}</span>` : ''}
               </div>
             </div>
             <div class="pos">${fmt(s.balance)}</div>
@@ -1281,10 +1141,9 @@ async function bindEvents() {
         const streakHTML = sortedByStreak.map(s => `
           <div class="row">
             <div style="display:flex;align-items:center;gap:8px">
-              ${renderBuddy(s.active_frame, 'transform:scale(0.5);width:34px;height:34px;margin-right:2px')}
+              ${renderBuddy(s.active_frame, 'transform:scale(0.5);width:34px;height:34px;margin-right:2px', s.mascot)}
               <div>
                 <b>${esc(s.name)}</b>
-                ${s.class_name ? `<span class="class-pill">${esc(s.class_name)}</span>` : ''}
               </div>
             </div>
             <div class="pos">🔥 ${s.streak || 0} aula(s)</div>
@@ -1297,11 +1156,13 @@ async function bindEvents() {
           ${streakHTML}
         `;
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
   /* Tab: Chamada (Teacher / Admin) */
   if (activeTab === 'att') {
+    if ($('#attendance-note')) $('#attendance-note').oninput = e => { attendanceNote = e.target.value; };
+    if ($('#attendance-all-btn')) $('#attendance-all-btn').onclick = () => runAction('attendance-bulk', markAllPresent);
     const adInput = $('#ad');
     if (adInput) {
       adInput.onchange = () => {
@@ -1310,37 +1171,22 @@ async function bindEvents() {
       };
     }
 
-    const classAttFilter = $('#class-att-filter');
-    if (classAttFilter) {
-      classAttFilter.onchange = () => {
-        selectedClassId = classAttFilter.value;
-        bindEvents();
-      };
-    }
-
     try {
-      const [attRes, classesRes] = await Promise.all([
-        api(`/api/attendance?date=${attendanceDate}&classId=${selectedClassId}`),
-        api('/api/classes' + (currentUser.role === 'teacher' ? '?mine=true' : ''))
-      ]);
-
-      if (classAttFilter && classAttFilter.children.length <= 1) {
-        classAttFilter.innerHTML = `<option value="">Todas as Minhas Turmas</option>` +
-          classesRes.classes.map(c => `<option value="${c.id}" ${selectedClassId == c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
-      }
+      const attRes = await api(`/api/attendance?date=${attendanceDate}`);
+      if (!isCurrentView()) return;
 
       const attListEl = $('#attendance-list');
       if (attListEl) {
         const students = attRes.records;
         if (!students.length) {
-          attListEl.innerHTML = '<div class="empty">Nenhum aluno encontrado nesta turma.</div>';
+          attListEl.innerHTML = '<div class="empty">Nenhum aluno cadastrado.</div>';
         } else {
           attListEl.innerHTML = students.map(s => {
             const st = s.status;
             return `
               <div class='row'>
                 <div>
-                  <b>${esc(s.name)}</b> ${s.class_name ? `<span class="class-pill">${esc(s.class_name)}</span>` : ''}
+                  <b>${esc(s.name)}</b>
                   <small>@${esc(s.username)}</small>
                 </div>
                 <div class='ab'>
@@ -1352,121 +1198,86 @@ async function bindEvents() {
           }).join('');
 
           document.querySelectorAll('.mk').forEach(btn => {
-            btn.onclick = () => markAttendance(btn.dataset.uid, btn.dataset.st);
+            btn.onclick = () => runAction('attendance-mark', () => markAttendance(btn.dataset.uid, btn.dataset.st));
           });
         }
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
   /* Tab: Lançar Méritos (Teacher / Admin) */
   if (activeTab === 'merit') {
     const awardBtn = $('#award-btn');
-    if (awardBtn) awardBtn.onclick = handleTeacherAward;
+    if (awardBtn) awardBtn.onclick = () => runAction('award', handleTeacherAward);
 
     const bulkBtn = $('#bulk-btn');
-    if (bulkBtn) bulkBtn.onclick = handleBulkReward;
+    if (bulkBtn) bulkBtn.onclick = () => runAction('bulk-reward', handleBulkReward);
 
     try {
       const { users } = await api('/api/users/recipients');
+      if (!isCurrentView()) return;
       const sel = $('#award_student');
       if (sel) {
         sel.innerHTML = `<option value="">Selecione o aluno...</option>` +
-          users.map(u => `<option value="${u.id}">${esc(u.name)} (${esc(u.class_name || 'Geral')})</option>`).join('');
+          users.map(u => `<option value="${u.id}">${esc(u.name)} (@${esc(u.username)})</option>`).join('');
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
-  /* Tab: Turmas & Alunos (Teacher) */
+  /* Tab: Alunos (Teacher) */
   if (activeTab === 'students') {
-    const stFilter = $('#students-class-filter');
-    if (stFilter) {
-      stFilter.onchange = () => {
-        selectedClassId = stFilter.value;
-        bindEvents();
-      };
-    }
-
     const createStudBtn = $('#create-student-btn');
-    if (createStudBtn) createStudBtn.onclick = () => handleCreateUser('aluno');
+    if (createStudBtn) createStudBtn.onclick = () => runAction('create-user', () => handleCreateUser('aluno'));
 
     try {
-      const [statsRes, classesRes] = await Promise.all([
-        api(`/api/admin/stats?classId=${selectedClassId}`),
-        api('/api/classes' + (currentUser.role === 'teacher' ? '?mine=true' : ''))
-      ]);
-
-      if (stFilter && stFilter.children.length <= 1) {
-        stFilter.innerHTML = `<option value="">Todas as Turmas</option>` +
-          classesRes.classes.map(c => `<option value="${c.id}" ${selectedClassId == c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
-      }
-
-      const ncSelect = $('#nc');
-      if (ncSelect) {
-        ncSelect.innerHTML = `<option value="">Selecione a turma...</option>` +
-          classesRes.classes.map(c => `<option value="${c.id}">${esc(c.name)} (${esc(c.level || 'Geral')})</option>`).join('');
-      }
+      const statsRes = await api('/api/admin/stats');
+      if (!isCurrentView()) return;
 
       const stTable = $('#teacher-students-table');
       if (stTable) {
         const students = statsRes.users.filter(u => u.role === 'aluno');
         stTable.innerHTML = `
-          <tr><th>Aluno</th><th>Turma</th><th>Saldo</th></tr>
+          <tr><th>Aluno</th><th>Usuário</th><th>Saldo</th></tr>
           ${students.map(s => `
             <tr>
-              <td>${esc(s.name)} <small style="display:block;color:var(--ink)">@${esc(s.username)}</small></td>
-              <td>${esc(s.class_name || '—')}</td>
+              <td>${esc(s.name)}</td>
+              <td>@${esc(s.username)}</td>
               <td><b>${fmt(s.balance)}</b></td>
             </tr>
           `).join('')}
         `;
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
   /* Tab: Imprimir Cartões Físicos (Ideia 6) */
   if (activeTab === 'cards') {
-    const cardClassFilter = $('#cards-class-filter');
-    if (cardClassFilter) {
-      cardClassFilter.onchange = () => {
-        selectedClassId = cardClassFilter.value;
-        bindEvents();
-      };
-    }
-
     const printNowBtn = $('#print-now-btn');
     if (printNowBtn) {
       printNowBtn.onclick = () => window.print();
     }
 
     try {
-      const [cardsRes, classesRes] = await Promise.all([
-        api(`/api/cards/students?classId=${selectedClassId}`),
-        api('/api/classes' + (currentUser.role === 'teacher' ? '?mine=true' : ''))
-      ]);
-
-      if (cardClassFilter && cardClassFilter.children.length <= 1) {
-        cardClassFilter.innerHTML = `<option value="">Todas as Turmas</option>` +
-          classesRes.classes.map(c => `<option value="${c.id}" ${selectedClassId == c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
-      }
+      const cardsRes = await api('/api/cards/students');
+      if (!isCurrentView()) return;
 
       const grid = $('#cards-grid');
       if (grid) {
         if (!cardsRes.cards.length) {
-          grid.innerHTML = '<div class="empty">Nenhum aluno cadastrado nesta turma para gerar cartões.</div>';
+          grid.innerHTML = '<div class="empty">Nenhum aluno cadastrado para gerar cartões.</div>';
         } else {
           grid.innerHTML = cardsRes.cards.map(c => `
             <div class="fisk-id-card">
               <div class="id-card-top">
-                <span class="id-card-title">FISK PIX</span>
+                <span class="id-card-title">FISK PAY</span>
                 <span style="font-size:10px;font-weight:bold;color:#1c3f8f">STUDENT ID</span>
               </div>
               <div class="id-card-body">
-                ${renderBuddy(c.active_frame, 'width:58px;height:58px')}
+                ${renderBuddy(c.active_frame, 'width:58px;height:58px', c.mascot)}
                 <div class="id-card-info">
                   <div class="id-card-name">${esc(c.name)}</div>
                   <div class="id-card-nick">@${esc(c.username)}</div>
-                  <div class="id-card-class">${esc(c.class_name)}</div>
+                  <div class="id-card-class">ALUNO FISK</div>
                   <div class="id-card-serial">${esc(c.serial)}</div>
                 </div>
                 <div class="id-card-qr">
@@ -1480,80 +1291,31 @@ async function bindEvents() {
           `).join('');
         }
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
-  /* Tab: Coordenação - Turmas & Professores */
+  /* Tab: Coordenação - Pessoas & Perfis */
   if (activeTab === 'coord_classes') {
-    const linkTeacherBtn = $('#link-teacher-btn');
-    if (linkTeacherBtn) linkTeacherBtn.onclick = handleAssignTeacherToClass;
-
-    const createTeachBtn = $('#create-teacher-btn');
-    if (createTeachBtn) {
-      createTeachBtn.onclick = () => {
-        const u = $('#t_username').value;
-        const n = $('#t_name').value;
-        const p = $('#t_password').value;
-        if (!u || !n || p.length < 6) return showToast('Preencha os campos do professor.');
-        api('/api/admin/create-user', 'POST', { username: u, name: n, password: p, role: 'teacher' })
-          .then(() => { showToast('Professor cadastrado!'); render(); })
-          .catch(err => showToast(err.message));
-      };
-    }
-
-    const createClassBtn = $('#create-class-btn');
-    if (createClassBtn) createClassBtn.onclick = handleCreateClass;
-
-    try {
-      const statsRes = await api('/api/admin/stats');
-      const table = $('#classes-table');
-      if (table) {
-        table.innerHTML = `
-          <tr><th>Turma</th><th>Nível</th><th>Professor(a)</th><th>Qtd. Alunos</th></tr>
-          ${statsRes.classes.map(c => `
-            <tr>
-              <td><b>${esc(c.name)}</b></td>
-              <td>${esc(c.level || 'Geral')}</td>
-              <td>${esc(c.teacher_name || '—')}</td>
-              <td>${c.student_count || 0}</td>
-            </tr>
-          `).join('')}
-        `;
-      }
-
-      const linkClassSel = $('#link_class');
-      if (linkClassSel) {
-        linkClassSel.innerHTML = statsRes.classes.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
-      }
-
-      const linkTeacherSel = $('#link_teacher');
-      const createClassTeacherSel = $('#c_teacher');
-      if (linkTeacherSel && statsRes.teachers) {
-        const teacherOpts = statsRes.teachers.map(t => `<option value="${t.id}">${esc(t.name)} (@${esc(t.username)})</option>`).join('');
-        linkTeacherSel.innerHTML = teacherOpts;
-        if (createClassTeacherSel) {
-          createClassTeacherSel.innerHTML = `<option value="">Sem professor por enquanto</option>` + teacherOpts;
-        }
-      }
-    } catch (e) {}
+    await loadPeople(isCurrentView);
   }
 
   /* Tab: Coordenação - Auditoria */
   if (activeTab === 'coord_audit') {
     try {
       const { logs } = await api('/api/coordenacao/audit');
+      if (!isCurrentView()) return;
       const table = $('#audit-table');
       if (table) {
         if (!logs.length) {
           table.innerHTML = '<tr><td colspan="5" class="empty">Nenhuma ação registrada até o momento.</td></tr>';
         } else {
           table.innerHTML = `
-            <tr><th>Data/Hora</th><th>Professor(a)</th><th>Ação</th><th>Aluno</th><th>Detalhes</th></tr>
+            <tr><th>Data/Hora</th><th>Responsável</th><th>Ação</th><th>Pessoa</th><th>Descrição</th></tr>
             ${logs.map(l => `
               <tr>
                 <td><small>${when(l.created_at)}</small></td>
                 <td><b>${esc(l.teacher_name)}</b></td>
-                <td><span class="class-pill">${esc(l.action)}</span></td>
+                <td><span class="class-pill">${esc(ACTION_LABELS[l.action] || l.action)}</span></td>
                 <td>${esc(l.target_name || '—')}</td>
                 <td>${esc(l.details)}</td>
               </tr>
@@ -1561,7 +1323,7 @@ async function bindEvents() {
           `;
         }
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
   /* Tab: Gestão Monetária (Coordenação / Admin) */
@@ -1577,21 +1339,21 @@ async function bindEvents() {
 
     try {
       const statsRes = await api('/api/admin/stats');
+      if (!isCurrentView()) return;
       const auSelect = $('#au');
       if (auSelect) {
-        auSelect.innerHTML = statsRes.users.map(u => `
-          <option value="${u.id}">${esc(u.name)} (${ROLE_LABELS[u.role]}${u.class_name ? ` · ${esc(u.class_name)}` : ''} - ${fmt(u.balance)})</option>
+        auSelect.innerHTML = '<option value="">Selecione a conta</option>' + statsRes.users.map(u => `
+          <option value="${u.id}">${esc(u.name)} (${ROLE_LABELS[u.role]} · ${fmt(u.balance)})</option>
         `).join('');
       }
 
       const accTable = $('#accounts-table');
       if (accTable) {
         accTable.innerHTML = `
-          <tr><th>Usuário</th><th>Turma</th><th>Função</th><th>Saldo</th></tr>
+          <tr><th>Usuário</th><th>Perfil</th><th>Saldo</th></tr>
           ${statsRes.users.map(u => `
             <tr>
               <td>${esc(u.name)} (@${esc(u.username)})</td>
-              <td>${esc(u.class_name || '—')}</td>
               <td>${ROLE_LABELS[u.role]}</td>
               <td><b>${fmt(u.balance)}</b></td>
             </tr>
@@ -1601,7 +1363,7 @@ async function bindEvents() {
 
       const econTitle = $('#economy-title');
       if (econTitle) {
-        econTitle.textContent = `Em Circulação: ${fmt(statsRes.stats.totalInCirculation)} · Total Alunos: ${statsRes.stats.totalUsers} · Professores: ${statsRes.stats.totalTeachers} · Turmas: ${statsRes.stats.totalClasses}`;
+        econTitle.textContent = `Em circulação: ${fmt(statsRes.stats.totalInCirculation)} · Alunos: ${statsRes.stats.totalUsers} · Professores: ${statsRes.stats.totalTeachers}`;
       }
 
       const gTxEl = $('#global-tx-list');
@@ -1609,7 +1371,7 @@ async function bindEvents() {
         gTxEl.innerHTML = statsRes.recentTransactions.map(tx => `
           <div class="row">
             <div>
-              <b>${tx.type.toUpperCase()}: ${esc(tx.from_name || 'Sistema')} → ${esc(tx.to_name)}</b>
+              <b>${esc(ACTION_LABELS[tx.type] || tx.type)}: ${esc(tx.from_name || 'Sistema')} → ${esc(tx.to_name)}</b>
               ${tx.note ? `<br><em>“${esc(tx.note)}”</em>` : ''}
               <small>${when(tx.created_at)}</small>
             </div>
@@ -1617,16 +1379,12 @@ async function bindEvents() {
           </div>
         `).join('');
       }
-    } catch (e) {}
+    } catch (e) { if (isCurrentView()) showLoadError(e); }
   }
 
   /* Tab: Relatórios Excel */
   if (activeTab === 'reports') {
-    const expAttBtn = $('#export-att-btn');
-    if (expAttBtn) expAttBtn.onclick = () => exportExcel('attendance');
-
-    const expTxBtn = $('#export-tx-btn');
-    if (expTxBtn) expTxBtn.onclick = () => exportExcel('transactions');
+    await loadReports(isCurrentView);
   }
 }
 

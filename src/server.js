@@ -54,6 +54,20 @@ function generateSerial(username) {
   return `B ${String(n).padStart(8, '0')} K`;
 }
 
+function userToken(user) {
+  return generateToken({ id: user.id, username: user.username, name: user.name, role: user.role, token_version: user.token_version });
+}
+
+function closeUserStreams(userId) {
+  for (const response of sseClients.get(userId) || []) response.end();
+  sseClients.delete(userId);
+}
+
+function publicUser(user) {
+  const { password_hash, token_version, ...safe } = user;
+  return { ...safe, serial: generateSerial(user.username) };
+}
+
 /* ========================================================
    Server-Sent Events Route
    ======================================================== */
@@ -100,7 +114,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   const user = (await db.getUserByUsername(rawUsername));
-  if (!user) {
+  if (!user || !user.is_active) {
     (await db.recordLoginFailure(rawUsername));
     return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
   }
@@ -113,12 +127,7 @@ app.post('/api/auth/login', async (req, res) => {
 
   (await db.clearLoginFailures(rawUsername));
 
-  const token = generateToken({
-    id: user.id,
-    username: user.username,
-    name: user.name,
-    role: user.role
-  });
+  const token = userToken(user);
 
   const streaks = user.role === 'aluno' ? (await db.calculateStreaks(user.id)) : null;
 
@@ -132,6 +141,9 @@ app.post('/api/auth/login', async (req, res) => {
       class_id: user.class_id,
       class_name: user.class_name,
       active_frame: user.active_frame || 'none',
+      active_theme: user.active_theme || 'default',
+      mascot: user.mascot || 'buddy',
+      is_active: user.is_active,
       balance: user.role === 'aluno' || user.role === 'admin' ? user.balance : null,
       serial: generateSerial(user.username),
       streaks
@@ -155,6 +167,9 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     class_id: user.class_id,
     class_name: user.class_name,
     active_frame: user.active_frame || 'none',
+    active_theme: user.active_theme || 'default',
+    mascot: user.mascot || 'buddy',
+    is_active: user.is_active,
     balance: user.role === 'aluno' || user.role === 'admin' ? user.balance : null,
     serial: generateSerial(user.username),
     streaks
@@ -162,13 +177,46 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
-  const { newPassword } = req.body;
-  if (!newPassword || newPassword.length < 6) {
-    return res.status(400).json({ error: 'A nova senha deve ter no mínimo 6 caracteres.' });
-  }
+  try {
+    const user = await db.resetUserPassword(req.user.id, req.user.id, req.body.newPassword, req.body.note);
+    closeUserStreams(user.id);
+    res.json({ success: true, token: userToken(user), message: 'Senha atualizada com sucesso!' });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 
-  (await db.updatePassword(req.user.id, newPassword));
-  res.json({ message: 'Senha atualizada com sucesso no servidor!' });
+app.patch('/api/profile', authenticateToken, async (req, res) => {
+  try {
+    const user = await db.updateProfile(req.user.id, req.body);
+    res.json({ success: true, user: publicUser(user) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.get('/api/pix/limit', authenticateToken, async (req, res) => {
+  res.json(await db.getPixLimit(req.user.id));
+});
+
+app.patch('/api/admin/users/:id', authenticateToken, requireRoles('admin', 'coordenacao'), async (req, res) => {
+  try {
+    const user = await db.editUser(req.user.id, Number(req.params.id), req.body);
+    closeUserStreams(user.id);
+    res.json({ success: true, user: publicUser(user), ...(user.id === req.user.id ? { token: userToken(user) } : {}) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/admin/users/:id/password', authenticateToken, requireRoles('admin', 'coordenacao'), async (req, res) => {
+  try {
+    const user = await db.resetUserPassword(req.user.id, Number(req.params.id), req.body.newPassword, req.body.note);
+    closeUserStreams(user.id);
+    res.json({ success: true, message: 'Senha atualizada. A nova senha já pode ser usada no login.', ...(user.id === req.user.id ? { token: userToken(user) } : {}) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.get('/api/reports', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
+  try {
+    res.json(await db.getReports(req.query.from, req.query.to));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 /* ========================================================
@@ -183,6 +231,9 @@ app.get('/api/wallet', authenticateToken, async (req, res) => {
     balance: user.balance,
     serial: generateSerial(user.username),
     active_frame: user.active_frame || 'none',
+    active_theme: user.active_theme || 'default',
+    mascot: user.mascot || 'buddy',
+    pixLimit: await db.getPixLimit(user.id),
     streaks,
     recentTransactions: tx
   });
@@ -391,6 +442,7 @@ app.get('/api/users/recipients', authenticateToken, async (req, res) => {
       name: u.name, 
       role: u.role,
       class_name: u.class_name,
+      mascot: u.mascot || 'buddy',
       active_frame: u.active_frame || 'none'
     }));
 
@@ -406,22 +458,24 @@ app.get('/api/ranking', authenticateToken, async (req, res) => {
 /* ========================================================
    Attendance Routes
    ======================================================== */
-app.get('/api/attendance', authenticateToken, async (req, res) => {
-  const date = req.query.date || new Date().toISOString().split('T')[0];
-  const classId = req.query.classId ? Number(req.query.classId) : null;
-  const list = (await db.getAttendanceForDate(date, classId));
-  res.json({ date, records: list });
+app.get('/api/attendance', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
+  try {
+    const date = req.query.date || db.localDate();
+    const classId = req.query.classId ? Number(req.query.classId) : null;
+    const list = (await db.getAttendanceForDate(date, classId));
+    res.json({ date, records: list });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.post('/api/attendance/mark', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
-  const { date, studentId, status } = req.body;
+  const { date, studentId, status, note } = req.body;
 
   if (!date || !studentId || !status) {
     return res.status(400).json({ error: 'Campos obrigatórios ausentes.' });
   }
 
   try {
-    const result = (await db.markAttendance(date, Number(studentId), status, req.user.id));
+    const result = (await db.markAttendance(date, Number(studentId), status, req.user.id, note));
 
     broadcastToUser(Number(studentId), 'attendance_updated', {
       date,
@@ -438,6 +492,15 @@ app.post('/api/attendance/mark', authenticateToken, requireRoles('teacher', 'adm
   }
 });
 
+app.post('/api/attendance/bulk', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
+  try {
+    if (req.body.status !== 'p') throw new Error('A ação coletiva disponível é marcar todos como presentes.');
+    const result = await db.markAllPresent(req.body.date, req.user.id, req.body.note);
+    broadcastToAll('balance_updated', { users: result.records.map(record => record.user_id) });
+    res.json({ success: true, result });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 /* ========================================================
    Fisk Store & Molduras Routes (Frames Only)
    ======================================================== */
@@ -447,11 +510,11 @@ app.get('/api/store/items', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/store/buy', authenticateToken, async (req, res) => {
-  const { itemId } = req.body;
-  if (!itemId) return res.status(400).json({ error: 'Moldura não informada.' });
+  const { itemId, note } = req.body;
+  if (!itemId) return res.status(400).json({ error: 'Item não informado.' });
 
   try {
-    const result = (await db.buyStoreItem(req.user.id, itemId));
+    const result = (await db.buyStoreItem(req.user.id, itemId, note));
 
     broadcastToUser(req.user.id, 'item_bought', {
       item: result.item,
@@ -469,13 +532,20 @@ app.post('/api/store/buy', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/store/equip', authenticateToken, async (req, res) => {
-  const { frameId } = req.body;
+  const { frameId, note } = req.body;
   try {
-    const result = (await db.equipFrame(req.user.id, frameId || 'none'));
+    const result = (await db.equipFrame(req.user.id, frameId || 'none', note));
     res.json({ success: true, message: 'Moldura atualizada!', result });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+app.post('/api/store/equip-theme', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.equipTheme(req.user.id, req.body.themeId || 'default', req.body.note);
+    res.json({ success: true, message: 'Tema atualizado!', result });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 /* ========================================================
@@ -484,7 +554,7 @@ app.post('/api/store/equip', authenticateToken, async (req, res) => {
 app.get('/api/admin/stats', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
   const classId = req.query.classId ? Number(req.query.classId) : null;
   const stats = (await db.getSystemStats());
-  const users = (await db.getAllUsers(classId));
+  const users = (await db.getAllUsers(classId, null, req.user.role !== 'teacher'));
   const teachers = (await db.getAllUsers(null, 'teacher'));
   const classes = (await db.getAllClasses());
   const tx = (await db.getTransactions(null, 'all', 20));
@@ -524,7 +594,7 @@ app.post('/api/admin/bulk-reward', authenticateToken, requireRoles('teacher', 'a
 });
 
 app.post('/api/admin/create-user', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
-  const { username, name, password, role, classId } = req.body;
+  const { username, name, password, role, classId, note } = req.body;
 
   if (!username || !name || !password || password.length < 6) {
     return res.status(400).json({ error: 'Preencha usuário, nome e senha com no mínimo 6 caracteres.' });
@@ -532,14 +602,20 @@ app.post('/api/admin/create-user', authenticateToken, requireRoles('teacher', 'a
 
   // Only Coordenação / Admin can create Teacher accounts
   let assignedRole = 'aluno';
-  if (role === 'teacher' && (req.user.role === 'admin' || req.user.role === 'coordenacao')) {
-    assignedRole = 'teacher';
+  if (role && !['aluno', 'teacher', 'coordenacao'].includes(role)) {
+    return res.status(400).json({ error: 'Perfil inválido.' });
+  }
+  if (req.user.role === 'teacher' && role && role !== 'aluno') {
+    return res.status(403).json({ error: 'Somente a coordenação pode criar professores ou outras contas de coordenação.' });
+  }
+  if (['teacher', 'coordenacao'].includes(role) && (req.user.role === 'admin' || req.user.role === 'coordenacao')) {
+    assignedRole = role;
   }
 
   try {
     const newUser = (await db.createUser(username, name, assignedRole, password, classId ? Number(classId) : null));
-    (await db.logAudit(req.user.id, 'create_user', newUser.id, `Cadastrou o ${assignedRole} "${name}" (@${username})`));
-    res.json({ success: true, user: newUser });
+    (await db.logAudit(req.user.id, 'create_user', newUser.id, `Cadastrou o ${assignedRole} "${name}" (@${username}). ${db.cleanNote(note)}`));
+    res.json({ success: true, user: publicUser(newUser) });
   } catch (err) {
     if (err.message && err.message.includes('UNIQUE')) {
       return res.status(400).json({ error: 'Este nome de usuário já está em uso.' });
@@ -550,20 +626,28 @@ app.post('/api/admin/create-user', authenticateToken, requireRoles('teacher', 'a
 
 // Excel Exports
 app.get('/api/admin/export/attendance', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
-  const classId = req.query.classId ? Number(req.query.classId) : null;
-  const csvData = (await db.exportAttendanceCSV(classId));
-
+  try {
+  const csvData = (await db.exportAttendanceCSV(req.query.from, req.query.to));
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="fisk-chamada-frequencia.csv"');
   res.send(csvData);
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.get('/api/admin/export/transactions', authenticateToken, requireRoles('teacher', 'admin', 'coordenacao'), async (req, res) => {
-  const csvData = (await db.exportTransactionsCSV());
-
+  try {
+  const csvData = (await db.exportTransactionsCSV(req.query.from, req.query.to));
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="fisk-extrato-geral.csv"');
   res.send(csvData);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.use('/api', (req, res) => res.status(404).json({ error: 'Operação não encontrada.' }));
+app.use((err, req, res, next) => {
+  console.error('[API]', err.message);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Não foi possível concluir a operação. Tente novamente.' });
 });
 
 // Single Page App fallback
@@ -573,7 +657,7 @@ app.use((req, res) => {
 
 db.initialize().then(() => {
   app.listen(PORT, () => {
-    console.log(`🚀 Fisk Pix iniciado na porta ${PORT} (Turso/SQLite)`);
+    console.log(`🚀 Fisk Pay iniciado na porta ${PORT} (Turso/SQLite)`);
   });
 }).catch(err => {
   console.error('[DB] Falha ao iniciar o banco:', err.message);

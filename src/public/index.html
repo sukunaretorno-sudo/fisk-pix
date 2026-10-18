@@ -3,25 +3,38 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Fisk Pix - Banco Digital da Turma</title>
+  <title>Fisk Pay - Conquistas que ensinam</title>
+  <meta name="description" content="Fisk Pay: sua carteira de conquistas, com acesso para alunos, professores e coordenação.">
+  <meta name="application-name" content="Fisk Pay">
   
   <!-- Web App Capabilities & Mobile Meta -->
   <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Fisk Pay">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#e31e24">
   <link rel="icon" type="image/jpeg" href="/assets/buddy.jpg">
+  <link rel="apple-touch-icon" href="/assets/buddy.jpg">
 
   <!-- Google Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Old+Standard+TT:wght@400;700&family=Roboto+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Inter:wght@400;450;500;550;600;650;700;750;800&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script>
+    try {
+      const theme = localStorage.getItem('fisk_theme');
+      if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+    } catch (_) {}
+  </script>
   
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
-  <div id="toast-container"></div>
+  <a class="skip-link" href="#main-content">Pular para o conteúdo</a>
+  <div id="toast-container" role="status" aria-live="polite" aria-atomic="false"></div>
   <div class="wrap" id="app"></div>
 
+  <script src="/js/ui.js"></script>
+  <script src="/js/features.js"></script>
   <script src="/js/app.js"></script>
 </body>
 </html>

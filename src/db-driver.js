@@ -20,24 +20,66 @@ function createDatabase() {
     const file = url.substring(5);
     const sqlite = new DatabaseSync(file);
     sqlite.exec('PRAGMA foreign_keys = ON;');
-    function nativeDb() {
+    let transactionTail = Promise.resolve();
+    async function acquire() {
+      const previous = transactionTail;
+      let release;
+      transactionTail = new Promise(resolve => { release = resolve; });
+      await previous;
+      return release;
+    }
+    function nativeDb(inTransaction = false) {
       return {
         prepare(sql) {
-          const statement = sqlite.prepare(sql);
+          const execute = async (method, args) => {
+            const release = inTransaction ? null : await acquire();
+            try { return sqlite.prepare(sql)[method](...args); }
+            finally { release?.(); }
+          };
           return {
-            get: async (...args) => statement.get(...args),
-            all: async (...args) => statement.all(...args),
-            run: async (...args) => statement.run(...args),
+            get: async (...args) => execute('get', args),
+            all: async (...args) => execute('all', args),
+            run: async (...args) => execute('run', args),
           };
         },
-        exec: async sql => sqlite.exec(sql),
+        exec: async sql => {
+          const release = inTransaction ? null : await acquire();
+          try { return sqlite.exec(sql); }
+          finally { release?.(); }
+        },
+        async migrate(statements) {
+          if (inTransaction) throw new Error('Migração não pode iniciar dentro de outra transação.');
+          const release = await acquire();
+          try {
+            sqlite.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+            for (const sql of statements) sqlite.exec(sql);
+            sqlite.exec('COMMIT;');
+          } catch (err) {
+            try { sqlite.exec('ROLLBACK;'); } catch {}
+            throw err;
+          } finally {
+            sqlite.exec('PRAGMA foreign_keys = ON;');
+            release();
+          }
+        },
         async transaction() {
-          sqlite.exec('BEGIN IMMEDIATE;');
+          if (inTransaction) throw new Error('Transações aninhadas não são suportadas.');
+          const release = await acquire();
+          try { sqlite.exec('BEGIN IMMEDIATE;'); }
+          catch (err) { release(); throw err; }
           let done = false;
           return {
-            ...nativeDb(),
-            async commit() { if (!done) { sqlite.exec('COMMIT;'); done = true; } },
-            async rollback() { if (!done) { sqlite.exec('ROLLBACK;'); done = true; } },
+            ...nativeDb(true),
+            async commit() {
+              if (!done) {
+                try { sqlite.exec('COMMIT;'); }
+                catch (err) { sqlite.exec('ROLLBACK;'); throw err; }
+                finally { done = true; release(); }
+              }
+            },
+            async rollback() {
+              if (!done) { try { sqlite.exec('ROLLBACK;'); } finally { done = true; release(); } }
+            },
           };
         },
       };
@@ -70,6 +112,7 @@ function createDatabase() {
   }
   return {
     ...wrap(client),
+    migrate: statements => client.migrate(statements),
     async transaction() {
       const tx = await client.transaction('write');
       let done = false;
